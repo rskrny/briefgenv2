@@ -1,4 +1,4 @@
-# app.py — BriefGen v2: Stage 1 (Ingestion) + Stage 2 (Product Research)
+# app.py — BriefGen v2: Ingestion + Product Research (auto-search on brand+product)
 
 import json
 from pathlib import Path
@@ -6,16 +6,18 @@ import streamlit as st
 
 from media_tools import download_video, probe_duration, extract_keyframes
 from ocr_tools import ocr_keyframes
-from product_research import fetch_pages, summarize_to_claims
+from product_research import auto_collect_product_docs, summarize_to_claims
 
-st.set_page_config(page_title="BriefGen v2 — Ingest + Research", layout="wide")
-st.title("🎬 BriefGen v2 — Stage 1: Ingestion · Stage 2: Product Research")
+st.set_page_config(page_title="BriefGen v2 — Ingest + Auto Research", layout="wide")
+st.title("🎬 BriefGen v2 — Stage 1: Ingestion · Stage 2: Product Research (auto)")
 
 # ---------------- State ----------------
-for k, v in {
+defaults = {
     "video_path": "", "keyframes": [], "ocr": [], "duration": 0.0,
-    "brand": "", "product": "", "product_urls": "", "research_json": {}, "approved_claims": []
-}.items():
+    "brand": "", "product": "", "extra_urls": "", "sources_used": [],
+    "research_json": {}, "approved_claims": []
+}
+for k, v in defaults.items():
     st.session_state.setdefault(k, v)
 
 # ---------------- Ingestion ----------------
@@ -90,27 +92,38 @@ if st.session_state.ocr:
         file_name="ocr_frames.json", mime="application/json",
     )
 
-# ---------------- Product Research ----------------
+# ---------------- Product Research (auto) ----------------
 st.markdown("---")
-st.header("3) Product research (auto-claims)")
+st.header("3) Product research (auto-find features)")
 
 st.session_state.brand = st.text_input("Brand", value=st.session_state.brand or "YourBrand")
 st.session_state.product = st.text_input("Product", value=st.session_state.product or "YourProduct")
-st.session_state.product_urls = st.text_area(
-    "Product page URL(s) (one per line)",
-    value=st.session_state.product_urls or "",
-    placeholder="https://example.com/product\nhttps://retailer.com/listing"
-)
 
-if st.button("🔎 Research Product (Gemini)", use_container_width=True):
-    urls = [u.strip() for u in st.session_state.product_urls.splitlines() if u.strip()]
-    with st.spinner("Fetching pages…"):
-        docs = fetch_pages(urls) if urls else []
+with st.expander("Optional: add your own source URLs (one per line)"):
+    st.session_state.extra_urls = st.text_area(
+        "Extra URLs (optional)",
+        value=st.session_state.extra_urls or "",
+        placeholder="https://example.com/product\nhttps://retailer.com/listing"
+    )
+
+if st.button("🔎 Auto Research (Gemini)", use_container_width=True):
+    with st.spinner("Searching the web for sources…"):
+        extra = [u.strip() for u in st.session_state.extra_urls.splitlines() if u.strip()]
+        docs, sources = auto_collect_product_docs(st.session_state.brand, st.session_state.product, extra_urls=extra)
+        st.session_state.sources_used = sources
+
     with st.spinner("Summarizing to proposed claims…"):
         research = summarize_to_claims(st.session_state.brand, st.session_state.product, docs)
-    st.session_state.research_json = research
+        st.session_state.research_json = research
+
+if st.session_state.sources_used:
+    st.subheader("Sources used")
+    for u in st.session_state.sources_used:
+        st.markdown(f"- {u}")
 
 if st.session_state.research_json:
+    conf = st.session_state.research_json.get("confidence", "unknown")
+    st.write(f"Model confidence: **{conf}**")
     st.subheader("Proposed claims (review & approve)")
     proposed = st.session_state.research_json.get("proposed_claims", [])
     approved = []
@@ -123,9 +136,15 @@ if st.session_state.research_json:
     for d in st.session_state.research_json.get("required_disclaimers", []) or []:
         st.markdown(f"- {d}")
 
+    sugg = st.session_state.research_json.get("source_suggestions", []) or []
+    if sugg:
+        with st.expander("Suggested sources to verify"):
+            for s in sugg:
+                st.markdown(f"- {s}")
+
     with st.expander("Raw research JSON", expanded=False):
         st.json(st.session_state.research_json)
 
     st.success(f"Approved {len(st.session_state.approved_claims)} claims ✅")
 
-st.caption("Next: Analyzer (style DNA + narrative) → Script (style-transfer) → PDF brief.")
+st.caption("Next up (Batch C): Analyzer (style DNA + narrative) → Script (style-transfer) → PDF brief.")
