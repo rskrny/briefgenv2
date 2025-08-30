@@ -1,4 +1,5 @@
-# app.py — BriefGen v2: Ingest + Auto Research + Analyzer + Script (Gemini)
+# app.py — BriefGen v2: Ingest · Auto Research · Analyze · Script · PDF
+# Uses: yt-dlp, ffmpeg, OpenCV, Tesseract, Gemini (google-generativeai), ReportLab
 
 import json
 from pathlib import Path
@@ -11,7 +12,7 @@ from prompts import build_analyzer_messages, build_script_messages
 from validators import validate_analyzer_json, validate_script_json
 from llm import gemini_json
 
-st.set_page_config(page_title="BriefGen v2 — Ingest · Research · Analyze · Script", layout="wide")
+st.set_page_config(page_title="BriefGen v2 — Ingest · Research · Analyze · Script · PDF", layout="wide")
 st.title("🎬 BriefGen v2")
 
 # ---------------- State ----------------
@@ -24,11 +25,12 @@ defaults = {
 for k, v in defaults.items():
     st.session_state.setdefault(k, v)
 
-# ---------------- Controls ----------------
+# ---------------- Sidebar controls ----------------
 with st.sidebar:
     st.header("Runtime / Platform")
     st.session_state.platform = st.selectbox("Platform", ["tiktok", "reels", "ytshorts"], index=0)
     st.session_state.target_runtime_s = st.slider("Target runtime (s)", 7, 60, 20, 1)
+
     st.markdown("---")
     st.header("Brand Voice (optional)")
     tone = st.text_input("Tone", value="conversational, confident, no hype")
@@ -40,7 +42,9 @@ with st.sidebar:
         "avoid": [x.strip() for x in avoid.splitlines() if x.strip()],
     }
 
-# ---------------- Ingestion ----------------
+# ==================================================
+# 1) Ingestion
+# ==================================================
 st.header("1) Reference video")
 c1, c2 = st.columns([2, 1])
 with c1:
@@ -87,33 +91,42 @@ st.header("2) Inspect (keyframes + OCR)")
 if st.session_state.video_path:
     st.write("**Video:**", st.session_state.video_path)
     st.write("**Duration:**", f"{st.session_state.duration:.2f}s")
+
 if st.session_state.keyframes:
     cols = st.columns(3)
     for i, fr in enumerate(st.session_state.keyframes):
         with cols[i % 3]:
             st.image(fr["path"], caption=f"t={fr['t']}s", use_container_width=True)
+
 if st.session_state.ocr:
     st.subheader("OCR")
     for rec in st.session_state.ocr:
         st.write(f"**t={rec['t']}s** • {rec['image_path']}")
         for line in rec["text"] or []:
             st.markdown(f"- {line}")
+
     st.download_button(
         "⬇️ keyframes_meta.json",
         data=json.dumps(st.session_state.keyframes, ensure_ascii=False, indent=2),
-        file_name="keyframes_meta.json", mime="application/json",
+        file_name="keyframes_meta.json",
+        mime="application/json",
     )
     st.download_button(
         "⬇️ ocr_frames.json",
         data=json.dumps({"frames": st.session_state.ocr}, ensure_ascii=False, indent=2),
-        file_name="ocr_frames.json", mime="application/json",
+        file_name="ocr_frames.json",
+        mime="application/json",
     )
 
-# ---------------- Product Research (auto) ----------------
+# ==================================================
+# 3) Product Research (auto)
+# ==================================================
 st.markdown("---")
 st.header("3) Product research (auto-find features)")
+
 st.session_state.brand = st.text_input("Brand", value=st.session_state.brand or "YourBrand")
 st.session_state.product = st.text_input("Product", value=st.session_state.product or "YourProduct")
+
 with st.expander("Optional: add your own source URLs (one per line)"):
     st.session_state.extra_urls = st.text_area(
         "Extra URLs (optional)",
@@ -139,6 +152,7 @@ if st.session_state.sources_used:
 if st.session_state.research_json:
     conf = st.session_state.research_json.get("confidence", "unknown")
     st.write(f"Model confidence: **{conf}**")
+
     st.subheader("Proposed claims (review & approve)")
     proposed = st.session_state.research_json.get("proposed_claims", []) or []
     if not proposed:
@@ -158,7 +172,9 @@ if st.session_state.research_json:
 
     st.success(f"Approved {len(st.session_state.approved_claims)} claims ✅")
 
-# ---------------- Analyzer (Gemini) ----------------
+# ==================================================
+# 4) Analyzer (Gemini)
+# ==================================================
 st.markdown("---")
 st.header("4) Analyze reference (director view)")
 
@@ -167,14 +183,15 @@ if st.button("🧠 Run Analyzer", use_container_width=True):
         st.warning("Run ingestion first to extract keyframes/OCR.")
     else:
         with st.spinner("Analyzing reference video (Gemini)…"):
-            # Build keyframe meta with only basename for image_ref convenience
-            kf_meta = [{"t": k["t"], "path": k["path"], "image_ref": Path(k["path"]).name} for k in st.session_state.keyframes]
+            # Use basename for image_ref convenience
+            kf_meta = [{"t": k["t"], "path": k["path"], "image_ref": Path(k["path"]).name}
+                       for k in st.session_state.keyframes]
             prompt = build_analyzer_messages(
                 platform=st.session_state.platform,
                 duration_s=st.session_state.duration or None,
                 keyframes_meta=kf_meta,
                 ocr_frames=st.session_state.ocr,
-                transcript_text=None,  # placeholder for future ASR
+                transcript_text=None,  # reserved for future ASR
                 aspect_ratio="9:16",
             )
             raw = gemini_json(prompt)
@@ -195,10 +212,13 @@ if st.session_state.analyzer_json:
     st.download_button(
         "⬇️ analyzer.json",
         data=json.dumps(st.session_state.analyzer_json, ensure_ascii=False, indent=2),
-        file_name="analyzer.json", mime="application/json",
+        file_name="analyzer.json",
+        mime="application/json",
     )
 
-# ---------------- Script (Gemini) ----------------
+# ==================================================
+# 5) Script (Gemini)
+# ==================================================
 st.markdown("---")
 st.header("5) Generate script (style-transfer)")
 
@@ -237,8 +257,38 @@ if st.session_state.script_json:
     st.download_button(
         "⬇️ script.json",
         data=json.dumps(st.session_state.script_json, ensure_ascii=False, indent=2),
-        file_name="script.json", mime="application/json",
+        file_name="script.json",
+        mime="application/json",
     )
 
+# ==================================================
+# 6) PDF Export
+# ==================================================
 st.markdown("---")
-st.caption("Next: PDF brief export with embedded keyframes & timestamped scene table. Say the word and I’ll add it.")
+st.header("6) Export PDF Brief")
+
+if st.session_state.analyzer_json and st.session_state.script_json:
+    if st.button("📄 Generate PDF Brief", use_container_width=True):
+        from pdf_export import make_brief_pdf
+        out_path = "brief.pdf"
+        pdf_bytes = make_brief_pdf(
+            out_path,
+            analyzer=st.session_state.analyzer_json,
+            script=st.session_state.script_json,
+            product_facts={
+                "brand": st.session_state.brand,
+                "product": st.session_state.product,
+                "approved_claims": st.session_state.approved_claims,
+                "required_disclaimers": st.session_state.required_disclaimers,
+            },
+            keyframe_images=st.session_state.keyframes,
+            title="Influencer Brief",
+        )
+        st.download_button(
+            "⬇️ Download Brief PDF",
+            data=pdf_bytes,
+            file_name="brief.pdf",
+            mime="application/pdf",
+        )
+else:
+    st.info("Run Analyzer + Script to enable PDF export.")
