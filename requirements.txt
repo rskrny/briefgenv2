@@ -6,3 +6,6 @@ pillow
 pytesseract
 reportlab
 google-generativeai
+requests
+readability-lxml
+beautifulsoup4
