@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple
 import re
 import time
 import urllib.parse
+import html
 import requests
 from readability import Document
 from bs4 import BeautifulSoup
@@ -14,12 +15,11 @@ from llm import gemini_json
 
 
 # ---------------------------
-# Web search (no API key)
+# DuckDuckGo HTML search (no API key)
 # ---------------------------
-def ddg_search(query: str, k: int = 6, timeout: int = 12) -> List[str]:
+def _ddg_search_once(query: str, k: int = 6, timeout: int = 12) -> List[Dict]:
     """
-    DuckDuckGo HTML search (no key). Returns a list of external result URLs.
-    We de-dupe and filter obvious redirect/track links.
+    Returns a list of {url, title} objects from DuckDuckGo's HTML endpoint.
     """
     url = "https://duckduckgo.com/html/"
     params = {"q": query}
@@ -31,14 +31,16 @@ def ddg_search(query: str, k: int = 6, timeout: int = 12) -> List[str]:
         return []
 
     soup = BeautifulSoup(r.text, "lxml")
+    results: List[Dict] = []
 
-    links: List[str] = []
-    # DuckDuckGo HTML often puts results in <a class="result__a"> or <a rel="nofollow" class="result__url">
-    for a in soup.select("a.result__a, a.result__url"):
+    # DDG HTML has <a class="result__a"> for titles/links
+    for a in soup.select("a.result__a"):
         href = a.get("href") or ""
+        text = a.get_text(strip=True) or ""
         if not href:
             continue
-        # Try to decode /l/?uddg= wrapped URLs
+
+        # Decode DDG redirect wrapper /l/?uddg=
         if "/l/?" in href and "uddg=" in href:
             try:
                 qs = urllib.parse.urlparse(href).query
@@ -47,26 +49,80 @@ def ddg_search(query: str, k: int = 6, timeout: int = 12) -> List[str]:
                     href = urllib.parse.unquote(uddg)
             except Exception:
                 pass
-        if href.startswith("http"):
-            links.append(href)
 
-    # De-dupe, drop obvious junk
-    clean = []
+        if href.startswith("http"):
+            results.append({"url": href, "title": text})
+
+    # Fallback: some themes use .result__url
+    if not results:
+        for a in soup.select("a.result__url"):
+            href = a.get("href") or ""
+            text = a.get_text(strip=True) or ""
+            if href.startswith("http"):
+                results.append({"url": href, "title": text})
+
+    # De-dupe by hostname+path (ignore scheme/www)
     seen = set()
-    for u in links:
-        if any(host in u for host in ["duckduckgo.com", "google.com/search"]):
-            continue
-        key = re.sub(r"https?://(www\.)?", "", u).rstrip("/")
+    uniq: List[Dict] = []
+    for r_ in results:
+        key = re.sub(r"^https?://(www\.)?", "", r_["url"]).rstrip("/")
         if key not in seen:
             seen.add(key)
-            clean.append(u)
-    return clean[:k]
+            uniq.append(r_)
+    return uniq[:k]
+
+
+def ddg_multi_search(queries: List[str], k_each: int = 6) -> List[Dict]:
+    bag: List[Dict] = []
+    seen = set()
+    for q in queries:
+        hits = _ddg_search_once(q, k=k_each)
+        for h in hits:
+            key = re.sub(r"^https?://(www\.)?", "", h["url"]).rstrip("/")
+            if key not in seen:
+                seen.add(key)
+                bag.append(h)
+        time.sleep(0.35)  # be polite
+    return bag
+
+
+# ---------------------------
+# Candidate ranking
+# ---------------------------
+_SITEMAP_HINTS = ("sitemap", "html-sitemap", "category", "tag", "/pages/", "/blog/page/")
+
+def rank_candidates(cands: List[Dict], product_token: str) -> List[Dict]:
+    """
+    Score URLs: prefer those that include the product token in URL or title,
+    demote sitemaps/index pages.
+    """
+    token = product_token.lower()
+    ranked = []
+    for c in cands:
+        url = c["url"]
+        title = (c.get("title") or "").lower()
+        path = re.sub(r"^https?://", "", url).lower()
+
+        score = 0
+        if token and (token in path or token in title):
+            score += 4
+        if any(h in path for h in _SITEMAP_HINTS):
+            score -= 3
+        if any(x in path for x in ("amazon.", "bestbuy.", "walmart.", "aliexpress.", "alibaba.", "bhphotovideo.")):
+            score += 2
+        if any(x in path for x in ("review", "spec", "features", "product")):
+            score += 1
+        c["__score"] = score
+        ranked.append(c)
+
+    ranked.sort(key=lambda x: x["__score"], reverse=True)
+    return ranked
 
 
 # ---------------------------
 # Fetch & clean pages
 # ---------------------------
-def fetch_pages(urls: List[str], per_page_char_cap: int = 12000) -> List[Dict]:
+def fetch_pages(urls: List[str], per_page_char_cap: int = 14000) -> List[Dict]:
     docs: List[Dict] = []
     headers = {"User-Agent": "Mozilla/5.0"}
     for url in urls:
@@ -75,17 +131,22 @@ def fetch_pages(urls: List[str], per_page_char_cap: int = 12000) -> List[Dict]:
         try:
             r = requests.get(url, timeout=15, headers=headers)
             r.raise_for_status()
-            html = r.text
-            doc = Document(html)
-            main_html = doc.summary() or html
+            html_raw = r.text
+            doc = Document(html_raw)
+            main_html = doc.summary() or html_raw
             soup = BeautifulSoup(main_html, "lxml")
+            # Remove scripts/nav/footers quickly
+            for bad in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+                bad.extract()
             text = soup.get_text("\n", strip=True)
             text = re.sub(r"\n{2,}", "\n", text)
+            # Discard super­short pages or pure sitemaps
+            if len(text) < 600 or "sitemap" in url.lower():
+                continue
             docs.append({"url": url, "text": text[:per_page_char_cap]})
         except Exception:
-            docs.append({"url": url, "text": ""})
-        # be polite
-        time.sleep(0.4)
+            pass
+        time.sleep(0.35)
     return docs
 
 
@@ -94,43 +155,50 @@ def fetch_pages(urls: List[str], per_page_char_cap: int = 12000) -> List[Dict]:
 # ---------------------------
 def auto_collect_product_docs(brand: str, product: str, extra_urls: List[str] | None = None) -> Tuple[List[Dict], List[str]]:
     """
-    Search the web for brand+product sources. Optionally merge user URLs.
-    Returns (docs, sources_used).
+    Build several queries, merge, rank, fetch → return (docs, sources_used).
     """
+    brand = (brand or "").strip()
+    product = (product or "").strip()
     extra_urls = [u.strip() for u in (extra_urls or []) if u.strip()]
 
-    # Craft a search query that tends to pull official/spec/review pages
-    q = f'{brand} {product} specs site:{brand.lower()}.com OR "{brand} {product}" review OR retailer listing'
-    candidates = ddg_search(q, k=7)
+    # 1) Multi-query search
+    brand_domain = re.sub(r"[^a-z0-9\-]", "", brand.lower()) + ".com" if brand else ""
+    queries = [
+        f'"{brand} {product}"',
+        f'"{brand} {product}" site:{brand_domain}' if brand_domain != ".com" else f'"{brand} {product}"',
+        f'{brand} {product} specifications',
+        f'{brand} {product} review',
+        f'{product} {brand} buy',
+    ]
+    raw_hits = ddg_multi_search(queries, k_each=6)
 
-    # If we got nothing, fall back to a simpler query
-    if not candidates:
-        candidates = ddg_search(f"{brand} {product} product features", k=6)
+    # 2) Merge with user URLs
+    for u in extra_urls:
+        raw_hits.append({"url": u, "title": u})
 
-    # Merge with user-provided URLs (if any), preserving order and uniqueness
-    merged = []
-    seen = set()
-    for u in (extra_urls + candidates):
-        key = re.sub(r"https?://(www\.)?", "", u).rstrip("/")
-        if key not in seen:
-            seen.add(key)
-            merged.append(u)
+    # 3) Rank
+    ranked = rank_candidates(raw_hits, product_token=product)
+    top_urls = [r["url"] for r in ranked[:10]]
 
-    docs = fetch_pages(merged)
-    sources = [d["url"] for d in docs if d.get("text")]
+    # 4) Fetch & clean
+    docs = fetch_pages(top_urls)
+    sources = [d["url"] for d in docs]
     return docs, sources
 
 
+# ---------------------------
+# Summarize to claims via Gemini
+# ---------------------------
 def summarize_to_claims(brand: str, product: str, docs: List[Dict], model: str = "gemini-1.5-pro") -> Dict:
     """
     Returns JSON with fields:
       product {brand,name,aliases}, key_features[], differentiators[], evidence_quotes[], proposed_claims[], risks[], required_disclaimers[], confidence, source_suggestions[]
-    If docs are empty/weak, the model must still produce a best-effort summary with lower confidence and suggestions to verify.
+    Must always return at least 3 proposed_claims; if documents are weak, set confidence="low" and keep language conservative.
     """
     docs_json = [{"source": d["url"], "excerpt": d["text"]} for d in docs if d.get("text")]
 
     prompt = f"""
-You are a compliance-aware product researcher. Use the provided documents if present; if not, infer cautiously from general knowledge and clearly lower confidence.
+You are a compliance-aware product researcher. Use the provided documents if present; if not, infer cautiously from general knowledge and lower confidence.
 
 Return JSON ONLY with this exact shape:
 {{
@@ -145,23 +213,22 @@ Return JSON ONLY with this exact shape:
   "source_suggestions": []
 }}
 
-Rules:
-- Prefer factual claims directly supported by the documents.
-- When a claim is based on general knowledge (because documents are missing), keep it conservative and mark overall "confidence" accordingly.
-- Phrase proposed_claims in simple, ad-safe language; avoid superlatives unless proven.
-- If battery/charging/safety are mentioned, include short required_disclaimers (e.g., "Battery life varies with use").
-- Include 2–5 short evidence_quotes with associated "source" URLs when available.
-- Keep lists concise (3–8 bullets each).
+Strict rules:
+- If documents are strong, base claims on them and add 2–5 short evidence_quotes (with source URLs).
+- If documents are weak/empty: still return 3–6 conservative proposed_claims typical for this product category, but set confidence="low" and include concrete source_suggestions to verify (e.g., official product page, major retailers).
+- Avoid superlatives unless quotes clearly support them.
+- Prefer short, ad-safe phrasing (no medical/health implications).
+- Keep each list 3–8 bullets.
 
 Brand: {brand}
 Product: {product}
 Documents (JSON, may be empty): {docs_json}
 """
     raw = gemini_json(prompt, model=model, temperature=0.1)
-    return safe_parse_json(raw)
+    return _safe_parse_json(raw)
 
 
-def safe_parse_json(s: str) -> Dict:
+def _safe_parse_json(s: str) -> Dict:
     import json
     try:
         return json.loads(s)
