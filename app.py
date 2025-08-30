@@ -127,7 +127,7 @@ if st.session_state.research_json:
     st.subheader("Proposed claims (review & approve)")
     proposed = st.session_state.research_json.get("proposed_claims", [])
     if not proposed:
-    st.info("No claims extracted yet. Try refining the Brand/Product name, or click Auto Research again.\n"
+        st.info("No claims extracted yet. Try refining the Brand/Product name, or click Auto Research again.\n"
             "Tip: include exact model code (e.g., BTW73) so search finds the right pages.")
     approved = []
     for i, c in enumerate(proposed):
