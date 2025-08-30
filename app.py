@@ -1,8 +1,9 @@
 # app.py — BriefGen v2: Ingest · Auto Research · Analyze · Script · PDF
-# Uses: yt-dlp, ffmpeg, OpenCV, Tesseract, Gemini (google-generativeai), ReportLab
+# Adds: keyframe lookup for reliable image embedding; passes research + kf_lookup to PDF.
 
 import json
 from pathlib import Path
+import os
 import streamlit as st
 
 from media_tools import download_video, probe_duration, extract_keyframes
@@ -17,7 +18,7 @@ st.title("🎬 BriefGen v2")
 
 # ---------------- State ----------------
 defaults = {
-    "video_path": "", "keyframes": [], "ocr": [], "duration": 0.0,
+    "video_path": "", "keyframes": [], "kf_lookup": {}, "ocr": [], "duration": 0.0,
     "brand": "", "product": "", "extra_urls": "", "sources_used": [],
     "research_json": {}, "approved_claims": [], "required_disclaimers": [],
     "analyzer_json": {}, "script_json": {}, "platform": "tiktok", "target_runtime_s": 20.0
@@ -76,6 +77,8 @@ if st.button("⚙️ Fetch & Prepare", type="primary", use_container_width=True)
 
         kfs = extract_keyframes(path, max_frames=6)
         st.session_state.keyframes = kfs
+        # Build a lookup so PDFs can reliably embed images by analyzer.keyframes[].image_ref
+        st.session_state.kf_lookup = {Path(k["path"]).name: {"path": k["path"], "t": k["t"]} for k in kfs}
 
         ocr = ocr_keyframes(kfs)
         st.session_state.ocr = ocr
@@ -183,7 +186,7 @@ if st.button("🧠 Run Analyzer", use_container_width=True):
         st.warning("Run ingestion first to extract keyframes/OCR.")
     else:
         with st.spinner("Analyzing reference video (Gemini)…"):
-            # Use basename for image_ref convenience
+            # Provide basename as image_ref for the model
             kf_meta = [{"t": k["t"], "path": k["path"], "image_ref": Path(k["path"]).name}
                        for k in st.session_state.keyframes]
             prompt = build_analyzer_messages(
@@ -283,6 +286,8 @@ if st.session_state.analyzer_json and st.session_state.script_json:
             },
             keyframe_images=st.session_state.keyframes,
             title="Influencer Brief",
+            research=st.session_state.research_json,
+            kf_lookup=st.session_state.kf_lookup,
         )
         st.download_button(
             "⬇️ Download Brief PDF",
