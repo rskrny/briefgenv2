@@ -1,13 +1,9 @@
 # llm.py
-# Thin JSON-only wrappers for Gemini and OpenAI with robust key loading.
-
 from __future__ import annotations
 import os, json, re
-from typing import Any, Dict, Optional
-
+from typing import Any, Dict, Optional, List
 
 def _get_secret(key: str) -> Optional[str]:
-    """Try env first, then Streamlit secrets if available."""
     val = os.getenv(key)
     if val:
         return val
@@ -19,9 +15,7 @@ def _get_secret(key: str) -> Optional[str]:
         pass
     return None
 
-
 def _extract_json(text: str) -> Dict[str, Any]:
-    """Best-effort JSON parse for occasionally noisy model outputs."""
     try:
         return json.loads(text)
     except Exception:
@@ -32,29 +26,18 @@ def _extract_json(text: str) -> Dict[str, Any]:
             return json.loads(m.group(0))
         except Exception:
             pass
-    return {"raw": text}
+    return {"raw": text or ""}
 
-
-def openai_json(
-    prompt: str,
-    *,
-    model: Optional[str] = None,
-    system: str = "",
-    temperature: float = 0.2,
-    max_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Call OpenAI Chat Completions and force a JSON object response."""
+# ---------------- OpenAI (text JSON) ----------------
+def openai_json(prompt: str, *, model: Optional[str] = None, system: str = "", temperature: float = 0.2, max_tokens: Optional[int] = None) -> Dict[str, Any]:
     from openai import OpenAI
-
     api_key = _get_secret("OPENAI_API_KEY")
-    client = OpenAI(api_key=api_key)  # uses env var internally if None
-
+    client = OpenAI(api_key=api_key)
     model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -65,44 +48,66 @@ def openai_json(
     text = resp.choices[0].message.content or ""
     return _extract_json(text)
 
+# --------------- OpenAI (images → JSON) ---------------
+def openai_json_from_images(prompt: str, image_paths: List[str], *, model: Optional[str] = None, temperature: float = 0.2) -> Dict[str, Any]:
+    """
+    Sends images + prompt and asks for JSON back.
+    """
+    from openai import OpenAI
+    import base64
+    api_key = _get_secret("OPENAI_API_KEY")
+    client = OpenAI(api_key=api_key)
+    model = model or os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+    parts = []
+    parts.append({"type": "text", "text": prompt})
+    for p in image_paths:
+        with open(p, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role":"user","content":parts}],
+        temperature=temperature,
+        response_format={"type": "json_object"},
+    )
+    text = resp.choices[0].message.content or ""
+    return _extract_json(text)
 
-def gemini_json(
-    prompt: str,
-    *,
-    model: Optional[str] = None,
-    system: str = "",
-    temperature: float = 0.2,
-) -> Dict[str, Any]:
-    """Call Gemini and force a JSON object response."""
+# ---------------- Gemini (text JSON) ----------------
+def gemini_json(prompt: str, *, model: Optional[str] = None, system: str = "", temperature: float = 0.2) -> Dict[str, Any]:
     import google.generativeai as genai
-
     api_key = _get_secret("GOOGLE_API_KEY")
     if not api_key:
-        # Helpful error for Streamlit Cloud users
-        raise RuntimeError(
-            "GOOGLE_API_KEY is not set. Add it via Streamlit secrets or environment."
-        )
+        raise RuntimeError("GOOGLE_API_KEY is not set.")
     genai.configure(api_key=api_key)
-
     model = model or os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
     full_prompt = (system + "\n\n" + prompt).strip() if system else prompt
-
     g = genai.GenerativeModel(model)
     resp = g.generate_content(
         full_prompt,
-        generation_config={
-            "response_mime_type": "application/json",
-            "temperature": temperature,
-        },
+        generation_config={"response_mime_type": "application/json", "temperature": temperature},
     )
+    text = getattr(resp, "text", "") or ""
+    if not text and getattr(resp, "candidates", None):
+        text = "".join(getattr(p, "text", "") for p in resp.candidates[0].content.parts)
+    return _extract_json(text)
 
-    # google-generativeai returns .text for the aggregated string
-    text = getattr(resp, "text", None)
-    if not text:
-        # Fallback: concatenate text parts if present
-        try:
-            parts = resp.candidates[0].content.parts
-            text = "".join(getattr(p, "text", "") for p in parts)
-        except Exception:
-            text = ""
-    return _extract_json(text or "{}")
+# --------------- Gemini (images → JSON) ---------------
+def gemini_json_from_images(prompt: str, image_paths: List[str], *, model: Optional[str] = None, temperature: float = 0.2) -> Dict[str, Any]:
+    import google.generativeai as genai
+    from PIL import Image
+    api_key = _get_secret("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY is not set.")
+    genai.configure(api_key=api_key)
+    model = model or os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-pro")
+    imgs = [Image.open(p) for p in image_paths]
+    g = genai.GenerativeModel(model)
+    resp = g.generate_content(
+        [prompt] + imgs,
+        generation_config={"response_mime_type": "application/json", "temperature": temperature},
+    )
+    text = getattr(resp, "text", "") or ""
+    if not text and getattr(resp, "candidates", None):
+        text = "".join(getattr(p, "text", "") for p in resp.candidates[0].content.parts)
+    return _extract_json(text)
