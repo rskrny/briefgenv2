@@ -1,0 +1,96 @@
+# pdf_spec_extractor.py
+from __future__ import annotations
+from typing import List, Tuple
+import re
+
+try:
+    from duckduckgo_search import DDGS
+except Exception:
+    DDGS = None
+
+# Choose one parser; pdfminer.six is pure-Python and reliable
+try:
+    from pdfminer.high_level import extract_text
+except Exception:
+    extract_text = None
+
+SPEC_KEYS = {
+    "weight": r"(?:^|\b)(?:item\s*)?weight[:\s\-]*([\d\.\,]+\s*(?:kg|g|lbs?|pounds|oz))",
+    "dimensions": r"(?:^|\b)(?:dimensions|size|measurements)[:\s\-]*([0-9\.\s×x\-]+(?:cm|mm|in|\"|')?)",
+    "capacity": r"(?:^|\b)(?:capacity|volume)[:\s\-]*([\d\.\,]+\s*(?:l|liters|ml|oz|mah|gb|tb))",
+    "battery_life": r"(?:^|\b)(?:battery\s*(?:life|runtime|playtime))[:\s\-]*([\d\.\,]+\s*(?:h|hr|hrs|hours|minutes|min))",
+    "power": r"(?:^|\b)(?:power|wattage|output)[:\s\-]*([\d\.\,]+\s*(?:w|kw|v|volts|amps|a))",
+    "screen": r"(?:^|\b)(?:screen|display|resolution)[:\s\-]*([0-9]{3,4}\s?[x×]\s?[0-9]{3,4}|[\d\.]+\s*(?:in|inch|\"))",
+    "ip_rating": r"\bip\s?([0-9]{2})\b",
+    "load_capacity": r"(?:max(?:imum)?\s+)?(?:load|weight)\s+capacit(?:y|ies)[:\s\-]*([\d\.\,]+\s*(?:lb|lbs|pounds|kg))",
+    "packed_size": r"(?:packed\s*(?:size|dimensions))[:\s\-]*([0-9\.\s×x\-]+(?:cm|mm|in|\"|')?)",
+    "seat_height": r"(?:seat\s*height)[:\s\-]*([\d\.\,]+\s*(?:cm|mm|in|\"|'))",
+    "materials": r"(?:materials?)[:\s\-]*([a-z0-9,\s\-\/\+]+)",
+}
+
+FEATURE_HINTS = [
+    "mesh seat","aluminum frame","reclining back","carry bag","shock-corded",
+    "quick-release","zippered pocket","cup holder","adjustable strap","breathable",
+    "folding frame","headrest","lumbar support","anti-slip feet","rubber feet"
+]
+
+def discover_spec_pdfs(brand: str, product: str, max_results: int = 4) -> List[str]:
+    if not DDGS:
+        return []
+    q = f"\"{brand} {product}\" (manual|datasheet|specifications) filetype:pdf"
+    urls = []
+    try:
+        with DDGS() as d:
+            for r in d.text(q, max_results=max_results):
+                u = r.get("href") or r.get("url") or ""
+                if u.lower().endswith(".pdf"):
+                    urls.append(u)
+    except Exception:
+        pass
+    return urls[:max_results]
+
+def _pdf_text(url: str) -> str:
+    if not extract_text:
+        return ""
+    import tempfile, requests, os
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            return ""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+            f.write(r.content)
+            tmp = f.name
+        txt = extract_text(tmp) or ""
+        try: os.remove(tmp)
+        except Exception: pass
+        return txt
+    except Exception:
+        return ""
+
+def extract_pdf_specs(url: str) -> Tuple[List[Tuple[str,str,str]], List[Tuple[str,str]]]:
+    """
+    Returns:
+      specs: list of (key, value, snippet)
+      features: list of (text, snippet)
+    """
+    txt = _pdf_text(url)
+    specs = []
+    feats = []
+    if not txt:
+        return specs, feats
+
+    # Normalize line breaks
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in txt.splitlines() if ln.strip()]
+    joined = "\n".join(lines)
+
+    for key, pat in SPEC_KEYS.items():
+        m = re.search(pat, joined, re.I)
+        if m:
+            specs.append((key, m.group(1).strip(), m.group(0)))
+
+    for hint in FEATURE_HINTS:
+        if re.search(re.escape(hint), joined, re.I):
+            # find a short snippet around it
+            m = re.search(r".{0,60}" + re.escape(hint) + r".{0,60}", joined, re.I)
+            feats.append((hint, m.group(0) if m else hint))
+    return specs, feats
