@@ -1,5 +1,5 @@
 # app.py
-# briefgenv2 — Analyzer v3 (URL or upload) with product-agnostic research + vision fallback + PDF
+# briefgenv2 — Analyzer v4: rock-solid product research (consensus + PDF/manuals), URL or upload
 from __future__ import annotations
 
 import os
@@ -12,7 +12,7 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
-# Local modules
+# Local modules expected in this repo
 from llm import gemini_json, openai_json
 from media_tools import (
     extract_duration,
@@ -30,7 +30,9 @@ from prompts import (
     ARCHETYPES,
     ARCHETYPE_PHASES,
 )
-from product_research import research_product
+
+# NEW: robust research stack
+from product_research import research_product  # returns provenance + confidence
 from vision_tools import infer_visual_features
 
 # Optional PDF export
@@ -39,7 +41,7 @@ try:
 except Exception:
     pe = None
 
-st.set_page_config(page_title="briefgenv2 — Analyzer v3", page_icon="🎬", layout="wide")
+st.set_page_config(page_title="briefgenv2 — Analyzer v4", page_icon="🎬", layout="wide")
 
 # ------------------------------
 # Few-shot anchors (tiny, inline)
@@ -169,10 +171,15 @@ with st.sidebar:
     pdf_brand = st.text_input("Brand Header", "BrandPal")
     pdf_footer = st.text_input("Footer Note", "Generated with briefgenv2")
 
+    st.markdown("---")
+    st.caption("Fetcher (optional)")
+    use_playwright = st.checkbox("Render pages with Playwright (JS-heavy sites)", value=False)
+    os.environ["USE_PLAYWRIGHT"] = "1" if use_playwright else "0"
+
 # ------------------------------
 # Main form
 # ------------------------------
-st.title("📽️ briefgenv2 — Analyzer v3")
+st.title("📽️ briefgenv2 — Analyzer v4")
 
 colA, colB = st.columns(2)
 with colA:
@@ -188,7 +195,8 @@ video_file = st.file_uploader("…or upload a video file", type=["mp4", "mov", "
 
 st.markdown("#### Product Research")
 product_url_override = st.text_input("Product page URL (optional — boosts accuracy)", "")
-auto_research = st.checkbox("Auto research from web + visuals (guarantee ≥4 features)", value=True)
+auto_research = st.checkbox("Auto research from web + visuals (consensus + PDFs)", value=True)
+confidence_cutoff = st.slider("Min confidence to include (0–1)", 0.0, 1.0, 0.6, 0.05)
 
 st.markdown("#### Optional: Claims & Disclaimers")
 approved_claims_manual = st.text_area("Approved Claims (one per line)", value="").strip().splitlines()
@@ -234,7 +242,7 @@ if run_btn:
         keyframes_meta = [{"t": round(x["t"], 2), "ref": f"kf@{round(x['t'], 2)}"} for x in kfs]
         ocr_frames = [{"t": round(f["t"], 2), "lines": f.get("lines", [])[:3]} for f in ocr]
 
-    # 3) Analyze
+    # 3) Analyze (archetype & phases)
     with st.spinner("Analyzing reference video (archetype-aware)…"):
         analyzer_prompt = build_analyzer_prompt_with_fewshots(
             platform=platform,
@@ -321,11 +329,14 @@ JSON you produced:
     except Exception as e:
         st.warning(f"Could not render phase keyframes: {e}")
 
-    # 4) Product research (domain-agnostic) with vision + OCR hints
-    research = {"query": "", "sources": [], "features": [], "specs": {}, "disclaimers": [], "claims": []}
+    # 4) Product research (consensus + PDFs) with vision + OCR hints
+    research = {
+        "query": "", "sources": [], "features": [], "specs": [],
+        "disclaimers": [], "claims": [], "notes": []
+    }
     extra_strip_imgs: List[Tuple[str, Image.Image]] = []  # for PDF storyboard density
     if auto_research:
-        with st.spinner("Researching the product (web + visuals)…"):
+        with st.spinner("Researching the product (consensus + PDF/manuals + visuals)…"):
             # Vision hints from a subset of frames
             kf_paths_for_vision = [k["image_path"] for k in kfs[:8]]
             vision = infer_visual_features(kf_paths_for_vision, provider=provider)
@@ -345,6 +356,7 @@ JSON you produced:
                 ocr_hints=ocr_hints,
                 vision_hints=vision_hints,
                 max_results=10,
+                min_confidence=confidence_cutoff,
             )
 
             # Build an extra keyframe strip (6 evenly spaced frames)
@@ -359,30 +371,38 @@ JSON you produced:
                     extra_strip_imgs.append((f"Ref @ {item['t']:.1f}s", img))
 
         st.subheader("Product Snapshot")
-        if research["sources"]:
-            st.markdown("**Sources**")
-            for s in research["sources"]:
-                st.write(f"- [{s['title']}]({s['url']})")
+        if research.get("sources"):
+            st.markdown("**Sources used**")
+            for s in research["sources"][:10]:
+                st.write(f"- [{s.get('title') or s.get('url')}]({s.get('url')})")
 
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown("**Features (guaranteed ≥4)**")
-            if research["features"]:
-                for f in research["features"][:12]:
-                    st.write(f"• {f}")
+            st.markdown("**High-confidence Features**")
+            feats = research.get("features") or []
+            if feats:
+                for f in feats[:12]:
+                    txt = f.get("text") if isinstance(f, dict) else str(f)
+                    st.write(f"• {txt}")
             else:
-                st.info("No features found (unexpected).")
+                st.info("No features reached confidence threshold.")
         with col2:
-            if research.get("specs"):
+            sp = research.get("specs") or []
+            if sp:
                 st.markdown("**Specs**")
-                for k, v in list(research["specs"].items())[:10]:
-                    st.write(f"• **{k.title()}**: {v}")
-            if research.get("disclaimers"):
+                for spec in sp[:12]:
+                    if isinstance(spec, dict):
+                        st.write(f"• **{spec.get('key','').title()}**: {spec.get('value','')}")
+                    else:
+                        st.write(f"• {spec}")
+            ds = research.get("disclaimers") or []
+            if ds:
                 st.markdown("**Disclaimers**")
-                for d in research["disclaimers"][:8]:
-                    st.write(f"• {d}")
+                for d in ds[:8]:
+                    txt = d.get("text") if isinstance(d, dict) else str(d)
+                    st.write(f"• {txt}")
 
-    # Merge manual + research
+    # Merge manual + research into script grounding
     def _dedupe(lst: List[str]) -> List[str]:
         seen = set()
         out = []
@@ -393,19 +413,32 @@ JSON you produced:
                 out.append(x.strip())
         return out
 
-    # Convert specs into safe bullets for script grounding
+    # Extract clean lists from research with confidence cutoff
+    research_features = []
+    for f in (research.get("features") or []):
+        if isinstance(f, dict):
+            if f.get("confidence", 0) >= confidence_cutoff:
+                research_features.append(f.get("text", ""))
+        elif isinstance(f, str):
+            research_features.append(f)
     spec_bullets: List[str] = []
-    for k, v in (research.get("specs") or {}).items():
-        if v:
-            spec_bullets.append(f"{k.title()}: {v}")
+    for s in (research.get("specs") or []):
+        if isinstance(s, dict):
+            if s.get("confidence", 0) >= confidence_cutoff and s.get("value"):
+                spec_bullets.append(f"{s.get('key','').title()}: {s.get('value')}")
+        elif isinstance(s, str):
+            spec_bullets.append(s)
 
-    # Prefer concrete features/specs only (drop free-form 'claims' to avoid slogans)
+    # Prefer concrete features/specs only (no free-form 'claims')
     final_claims = _dedupe(
         (approved_claims_manual or [])
-        + (research.get("features") or [])
+        + research_features
         + spec_bullets
     )
-    final_disclaimers = _dedupe((required_disclaimers_manual or []) + (research.get("disclaimers") or []))
+    final_disclaimers = _dedupe(
+        (required_disclaimers_manual or [])
+        + [d.get("text","") if isinstance(d,dict) else str(d) for d in (research.get("disclaimers") or [])]
+    )
 
     # 5) Script generation
     with st.spinner("Generating script & shot list…"):
@@ -448,7 +481,7 @@ JSON you produced:
                 plan=script_json,
                 phase_images=imgs if 'imgs' in locals() else [],
                 research=research,
-                extra_keyframes=extra_strip_imgs,  # NEW: denser storyboard
+                extra_keyframes=extra_strip_imgs,
             )
             st.subheader("Export PDF")
             st.download_button("⬇️ Download PDF", data=pdf_bytes, file_name=f"brief_{product}.pdf", mime="application/pdf")
