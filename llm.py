@@ -20,7 +20,7 @@ def _extract_json(text: str) -> Dict[str, Any]:
         return json.loads(text)
     except Exception:
         pass
-    m = re.search(r"\{.*\}", text, re.S)
+    m = re.search(r"\{.*\}", text or "", re.S)
     if m:
         try:
             return json.loads(m.group(0))
