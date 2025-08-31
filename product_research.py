@@ -2,9 +2,9 @@
 """
 Robust, product-agnostic research pipeline with:
 - Multi-query resolver (site + manual + pdf/manual paths)
-- Page rendering (Playwright if available) with scoring to prefer product pages
+- Optional headless rendering if available, otherwise requests
 - Schema.org Product + DOM sections parsing
-- PDF/manual spec extraction
+- PDF/manual spec extraction (prefers PyMuPDF; falls back to pdfminer.six)
 - Anti-slogan firewall & noun-based feature filter
 - Unit normalization (pint if available)
 - Consensus aggregator (manufacturer first, else ≥2 sources)
@@ -14,8 +14,8 @@ Robust, product-agnostic research pipeline with:
 
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
-import re, json, math
+from dataclasses import dataclass
+import re, json
 from urllib.parse import urlparse
 
 # Optional deps – all gracefully optional
@@ -35,18 +35,23 @@ except Exception:
     BeautifulSoup = None
 
 try:
-    from readability import Document
+    from readability import Document  # optional; may be missing on Streamlit Cloud
 except Exception:
     Document = None
 
+# PDF parsers (both optional; we'll try PyMuPDF first, then pdfminer.six)
 try:
     import fitz  # PyMuPDF
 except Exception:
     fitz = None
+try:
+    from pdfminer.high_level import extract_text as pdfminer_extract_text
+except Exception:
+    pdfminer_extract_text = None
 
 # Local helper modules
 try:
-    from fetcher import get_html  # headless rendering if available
+    from fetcher import get_html  # optional headless rendering if available
 except Exception:
     get_html = None
 
@@ -126,7 +131,7 @@ def ddg_search_multi(queries: List[str], max_results: int = 10) -> List[Dict[str
 
 # -------------------- Fetch --------------------
 def fetch_html(url: str, timeout: int = 15) -> Optional[str]:
-    # prefer headless renderer
+    # prefer headless renderer if available
     if get_html:
         try:
             html = get_html(url, timeout=timeout)
@@ -196,7 +201,10 @@ def texts_from_dom(html: str) -> List[str]:
     # Remove obvious boilerplate containers
     for sel in ["header","footer","nav","aside",".site-header",".site-footer",".newsletter",".subscribe",".promo",".banner"]:
         for tag in soup.select(sel):
-            tag.decompose()
+            try:
+                tag.decompose()
+            except Exception:
+                pass
 
     texts=[]
     # Section headings & lists/rows under them
@@ -223,7 +231,7 @@ def texts_from_dom(html: str) -> List[str]:
         t=" ".join(h.get_text(" ").split())
         if 2 <= len(t.split()) <= 14: texts.append(t)
 
-    # Readability main text
+    # Readability main text (optional)
     if Document:
         try:
             doc = Document(html)
@@ -306,23 +314,47 @@ def extract_disclaimers(lines: List[str]) -> List[str]:
 
 # -------------------- PDF/manual parser --------------------
 def pdf_text_from_url(url: str, timeout: int = 20) -> List[str]:
-    if not (requests and fitz):
+    """Return list of text lines from a PDF URL using PyMuPDF if available,
+    otherwise pdfminer.six. Returns [] if neither is available."""
+    if not requests:
         return []
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout)
         if "application/pdf" not in r.headers.get("Content-Type","").lower():
             return []
-        with fitz.open(stream=r.content, filetype="pdf") as doc:
-            lines=[]
-            for page in doc:
-                text = page.get_text("text")
-                if text:
-                    for ln in text.splitlines():
-                        ln = " ".join(ln.split())
-                        if ln: lines.append(ln)
-            return lines[:2000]
+        content = r.content
     except Exception:
         return []
+
+    # 1) Try PyMuPDF (fast, structured)
+    if fitz:
+        try:
+            lines=[]
+            with fitz.open(stream=content, filetype="pdf") as doc:
+                for page in doc:
+                    text = page.get_text("text")
+                    if text:
+                        for ln in text.splitlines():
+                            ln = " ".join(ln.split())
+                            if ln: lines.append(ln)
+            return lines[:2000]
+        except Exception:
+            pass
+
+    # 2) Fallback: pdfminer.six
+    if pdfminer_extract_text:
+        try:
+            from io import BytesIO
+            text = pdfminer_extract_text(BytesIO(content)) or ""
+            lines = []
+            for ln in text.splitlines():
+                ln = " ".join(ln.split())
+                if ln: lines.append(ln)
+            return lines[:2000]
+        except Exception:
+            pass
+
+    return []
 
 def extract_specs_from_pdf_lines(lines: List[str]) -> Dict[str, str]:
     if not lines:
