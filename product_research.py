@@ -1,236 +1,210 @@
 # product_research.py
-# Auto-search + scrape product pages → summarize to proposed claims (Gemini)
+"""
+Lightweight product research:
+- Searches the web for the brand/product.
+- Fetches a handful of pages and extracts likely feature claims & disclaimers.
+- Returns a bundle for downstream use (UI, script prompt, PDF).
+
+Notes:
+- Uses duckduckgo-search (no API key). On hosts without egress, it will gracefully return empty results.
+- Heuristics are intentionally conservative: short, non-comparative, non-metric-heavy claims only.
+"""
 
 from __future__ import annotations
-from typing import List, Dict, Tuple
+from typing import List, Dict, Any, Optional
 import re
-import time
-import urllib.parse
-import html
-import requests
-from readability import Document
-from bs4 import BeautifulSoup
 
-from llm import gemini_json
+try:
+    from duckduckgo_search import DDGS  # pip install duckduckgo-search
+except Exception:
+    DDGS = None
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except Exception:
+    requests, BeautifulSoup = None, None
 
 
-# ---------------------------
-# DuckDuckGo HTML search (no API key)
-# ---------------------------
-def _ddg_search_once(query: str, k: int = 6, timeout: int = 12) -> List[Dict]:
-    """
-    Returns a list of {url, title} objects from DuckDuckGo's HTML endpoint.
-    """
-    url = "https://duckduckgo.com/html/"
-    params = {"q": query}
-    headers = {"User-Agent": "Mozilla/5.0"}
+SAFE_WORDS = {
+    # general feature-y terms we allow
+    "lightweight", "portable", "folding", "foldable", "packable", "compact",
+    "durable", "sturdy", "stable", "breathable", "water-resistant", "waterproof",
+    "adjustable", "reclining", "recliner", "comfortable", "comfort", "support",
+    "cup holder", "carry bag", "quick setup", "easy setup", "easy to clean",
+}
+
+RISKY_PATTERNS = [
+    r"\b(safest|best|#1|guarantee|cure|miracle)\b",
+    r"\b(\d{2,}% better|\d{2,}% more|\d+x)\b",
+    r"\b(FDA|CE|UL|ISO)\b",  # certifications we don't want to invent
+]
+
+DISCLAIMER_PATTERNS = [
+    r"\b(do not exceed|max(?:imum)? weight|weight capacity)\b",
+    r"\b(read (the )?instructions\b|\bfollow (all )?warnings\b)",
+    r"\b(not (a|intended) (medical|safety) device)\b",
+]
+
+HEADERS = {"User-Agent": "briefgenv2/1.0 (+https://github.com/)"}
+
+
+def _clean_text(t: str) -> str:
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _fetch_html(url: str, timeout: int = 12) -> Optional[str]:
+    if not requests:
+        return None
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
-        r.raise_for_status()
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        if "text/html" not in r.headers.get("Content-Type", ""):
+            return None
+        return r.text
     except Exception:
-        return []
+        return None
 
-    soup = BeautifulSoup(r.text, "lxml")
-    results: List[Dict] = []
 
-    # DDG HTML has <a class="result__a"> for titles/links
-    for a in soup.select("a.result__a"):
-        href = a.get("href") or ""
-        text = a.get_text(strip=True) or ""
-        if not href:
-            continue
+def _extract_sentences(text: str) -> List[str]:
+    # very light sentence splitter
+    bits = re.split(r"(?<=[.!?])\s+", text)
+    lines = []
+    for b in bits:
+        b = _clean_text(b)
+        if 6 <= len(b) <= 180:
+            lines.append(b)
+    return lines
 
-        # Decode DDG redirect wrapper /l/?uddg=
-        if "/l/?" in href and "uddg=" in href:
-            try:
-                qs = urllib.parse.urlparse(href).query
-                uddg = urllib.parse.parse_qs(qs).get("uddg", [""])[0]
-                if uddg:
-                    href = urllib.parse.unquote(uddg)
-            except Exception:
-                pass
 
-        if href.startswith("http"):
-            results.append({"url": href, "title": text})
+def _looks_like_claim(line: str) -> bool:
+    low = line.lower()
+    if any(re.search(p, low) for p in RISKY_PATTERNS):
+        return False
+    # avoid comparative "better than" etc.
+    if " than " in low or " vs " in low:
+        return False
+    # prefer short, feature-like sentences
+    if len(line.split()) > 20:
+        return False
+    # must have at least one safe-ish word OR typical feature verbs
+    if any(w in low for w in SAFE_WORDS) or any(
+        v in low for v in ["features", "includes", "designed", "built-in", "comes with"]
+    ):
+        return True
+    return False
 
-    # Fallback: some themes use .result__url
-    if not results:
-        for a in soup.select("a.result__url"):
-            href = a.get("href") or ""
-            text = a.get_text(strip=True) or ""
-            if href.startswith("http"):
-                results.append({"url": href, "title": text})
 
-    # De-dupe by hostname+path (ignore scheme/www)
+def _dedupe_keep_order(items: List[str]) -> List[str]:
     seen = set()
-    uniq: List[Dict] = []
-    for r_ in results:
-        key = re.sub(r"^https?://(www\.)?", "", r_["url"]).rstrip("/")
+    out = []
+    for it in items:
+        key = it.lower()
         if key not in seen:
             seen.add(key)
-            uniq.append(r_)
-    return uniq[:k]
+            out.append(it)
+    return out
 
 
-def ddg_multi_search(queries: List[str], k_each: int = 6) -> List[Dict]:
-    bag: List[Dict] = []
-    seen = set()
-    for q in queries:
-        hits = _ddg_search_once(q, k=k_each)
-        for h in hits:
-            key = re.sub(r"^https?://(www\.)?", "", h["url"]).rstrip("/")
-            if key not in seen:
-                seen.add(key)
-                bag.append(h)
-        time.sleep(0.35)  # be polite
-    return bag
+def _extract_claims_and_disclaimers(html: str) -> Dict[str, List[str]]:
+    if not BeautifulSoup:
+        return {"claims": [], "disclaimers": [], "features": []}
+    soup = BeautifulSoup(html, "html.parser")
+    # try to pull list items and short paragraphs
+    texts = []
+    for li in soup.select("li"):
+        s = _clean_text(li.get_text(" "))
+        if 3 <= len(s.split()) <= 16:
+            texts.append(s)
+    for p in soup.select("p"):
+        s = _clean_text(p.get_text(" "))
+        if 4 <= len(s.split()) <= 20:
+            texts.append(s)
+    # also h2/h3 sections can carry features
+    for h in soup.select("h2, h3, h4"):
+        s = _clean_text(h.get_text(" "))
+        if 2 <= len(s.split()) <= 12:
+            texts.append(s)
 
+    # last resort: short sentences from whole text
+    if len(texts) < 10:
+        texts.extend(_extract_sentences(_clean_text(soup.get_text(" ")))[:30])
 
-# ---------------------------
-# Candidate ranking
-# ---------------------------
-_SITEMAP_HINTS = ("sitemap", "html-sitemap", "category", "tag", "/pages/", "/blog/page/")
+    claims: List[str] = []
+    discls: List[str] = []
+    features: List[str] = []
 
-def rank_candidates(cands: List[Dict], product_token: str) -> List[Dict]:
-    """
-    Score URLs: prefer those that include the product token in URL or title,
-    demote sitemaps/index pages.
-    """
-    token = product_token.lower()
-    ranked = []
-    for c in cands:
-        url = c["url"]
-        title = (c.get("title") or "").lower()
-        path = re.sub(r"^https?://", "", url).lower()
-
-        score = 0
-        if token and (token in path or token in title):
-            score += 4
-        if any(h in path for h in _SITEMAP_HINTS):
-            score -= 3
-        if any(x in path for x in ("amazon.", "bestbuy.", "walmart.", "aliexpress.", "alibaba.", "bhphotovideo.")):
-            score += 2
-        if any(x in path for x in ("review", "spec", "features", "product")):
-            score += 1
-        c["__score"] = score
-        ranked.append(c)
-
-    ranked.sort(key=lambda x: x["__score"], reverse=True)
-    return ranked
-
-
-# ---------------------------
-# Fetch & clean pages
-# ---------------------------
-def fetch_pages(urls: List[str], per_page_char_cap: int = 14000) -> List[Dict]:
-    docs: List[Dict] = []
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for url in urls:
-        if not url or not url.strip():
+    for line in texts:
+        low = line.lower()
+        if any(re.search(p, low) for p in DISCLAIMER_PATTERNS):
+            discls.append(line)
             continue
-        try:
-            r = requests.get(url, timeout=15, headers=headers)
-            r.raise_for_status()
-            html_raw = r.text
-            doc = Document(html_raw)
-            main_html = doc.summary() or html_raw
-            soup = BeautifulSoup(main_html, "lxml")
-            # Remove scripts/nav/footers quickly
-            for bad in soup(["script", "style", "noscript", "header", "footer", "nav"]):
-                bad.extract()
-            text = soup.get_text("\n", strip=True)
-            text = re.sub(r"\n{2,}", "\n", text)
-            # Discard super­short pages or pure sitemaps
-            if len(text) < 600 or "sitemap" in url.lower():
-                continue
-            docs.append({"url": url, "text": text[:per_page_char_cap]})
-        except Exception:
-            pass
-        time.sleep(0.35)
-    return docs
+        if _looks_like_claim(line):
+            claims.append(line)
+            # treat some as visible features, too
+            for w in SAFE_WORDS:
+                if w in low:
+                    features.append(w)
+                    break
+
+    return {
+        "claims": _dedupe_keep_order(claims)[:12],
+        "disclaimers": _dedupe_keep_order(discls)[:6],
+        "features": _dedupe_keep_order(features)[:12],
+    }
 
 
-# ---------------------------
-# Product research orchestrator
-# ---------------------------
-def auto_collect_product_docs(brand: str, product: str, extra_urls: List[str] | None = None) -> Tuple[List[Dict], List[str]]:
+def research_product(brand: str, product: str, *, max_results: int = 5, broaden_query: bool = True) -> Dict[str, Any]:
     """
-    Build several queries, merge, rank, fetch → return (docs, sources_used).
+    Returns:
+      {
+        "query": "...",
+        "sources": [{"title": "...", "url": "..."}, ...],
+        "claims": [...],
+        "disclaimers": [...],
+        "features": [...]
+      }
     """
-    brand = (brand or "").strip()
-    product = (product or "").strip()
-    extra_urls = [u.strip() for u in (extra_urls or []) if u.strip()]
+    bundle: Dict[str, Any] = {
+        "query": "",
+        "sources": [],
+        "claims": [],
+        "disclaimers": [],
+        "features": [],
+    }
+    if not DDGS or not requests or not BeautifulSoup:
+        return bundle  # offline / restricted environment
 
-    # 1) Multi-query search
-    brand_domain = re.sub(r"[^a-z0-9\-]", "", brand.lower()) + ".com" if brand else ""
-    queries = [
-        f'"{brand} {product}"',
-        f'"{brand} {product}" site:{brand_domain}' if brand_domain != ".com" else f'"{brand} {product}"',
-        f'{brand} {product} specifications',
-        f'{brand} {product} review',
-        f'{product} {brand} buy',
-    ]
-    raw_hits = ddg_multi_search(queries, k_each=6)
+    q = f"{brand} {product} features"
+    if broaden_query:
+        q += " site:official OR site:shop OR review"
+    bundle["query"] = q
 
-    # 2) Merge with user URLs
-    for u in extra_urls:
-        raw_hits.append({"url": u, "title": u})
-
-    # 3) Rank
-    ranked = rank_candidates(raw_hits, product_token=product)
-    top_urls = [r["url"] for r in ranked[:10]]
-
-    # 4) Fetch & clean
-    docs = fetch_pages(top_urls)
-    sources = [d["url"] for d in docs]
-    return docs, sources
-
-
-# ---------------------------
-# Summarize to claims via Gemini
-# ---------------------------
-def summarize_to_claims(brand: str, product: str, docs: List[Dict], model: str = "gemini-1.5-pro") -> Dict:
-    """
-    Returns JSON with fields:
-      product {brand,name,aliases}, key_features[], differentiators[], evidence_quotes[], proposed_claims[], risks[], required_disclaimers[], confidence, source_suggestions[]
-    Must always return at least 3 proposed_claims; if documents are weak, set confidence="low" and keep language conservative.
-    """
-    docs_json = [{"source": d["url"], "excerpt": d["text"]} for d in docs if d.get("text")]
-
-    prompt = f"""
-You are a compliance-aware product researcher. Use the provided documents if present; if not, infer cautiously from general knowledge and lower confidence.
-
-Return JSON ONLY with this exact shape:
-{{
-  "product": {{"brand":"", "name":"", "aliases":[]}},
-  "key_features": [],
-  "differentiators": [],
-  "evidence_quotes": [{{"text":"", "source":""}}],
-  "proposed_claims": [],
-  "risks": [],
-  "required_disclaimers": [],
-  "confidence": "high|medium|low",
-  "source_suggestions": []
-}}
-
-Strict rules:
-- If documents are strong, base claims on them and add 2–5 short evidence_quotes (with source URLs).
-- If documents are weak/empty: still return 3–6 conservative proposed_claims typical for this product category, but set confidence="low" and include concrete source_suggestions to verify (e.g., official product page, major retailers).
-- Avoid superlatives unless quotes clearly support them.
-- Prefer short, ad-safe phrasing (no medical/health implications).
-- Keep each list 3–8 bullets.
-
-Brand: {brand}
-Product: {product}
-Documents (JSON, may be empty): {docs_json}
-"""
-    raw = gemini_json(prompt, model=model, temperature=0.1)
-    return _safe_parse_json(raw)
-
-
-def _safe_parse_json(s: str) -> Dict:
-    import json
     try:
-        return json.loads(s)
+        hits = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(q, max_results=max_results):
+                url = r.get("href") or r.get("url")
+                title = r.get("title") or r.get("body") or url
+                if not url:
+                    continue
+                hits.append({"title": title, "url": url})
     except Exception:
-        return {}
+        hits = []
+
+    bundle["sources"] = hits
+    all_claims, all_disc, all_feats = [], [], []
+
+    for h in hits:
+        html = _fetch_html(h["url"])
+        if not html:
+            continue
+        ext = _extract_claims_and_disclaimers(html)
+        all_claims.extend(ext["claims"])
+        all_disc.extend(ext["disclaimers"])
+        all_feats.extend(ext["features"])
+
+    bundle["claims"] = _dedupe_keep_order(all_claims)[:20]
+    bundle["disclaimers"] = _dedupe_keep_order(all_disc)[:12]
+    bundle["features"] = _dedupe_keep_order(all_feats)[:20]
+    return bundle
