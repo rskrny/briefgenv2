@@ -323,6 +323,7 @@ JSON you produced:
 
     # 4) Product research (domain-agnostic) with vision + OCR hints
     research = {"query": "", "sources": [], "features": [], "specs": {}, "disclaimers": [], "claims": []}
+    extra_strip_imgs: List[Tuple[str, Image.Image]] = []  # for PDF storyboard density
     if auto_research:
         with st.spinner("Researching the product (web + visuals)…"):
             # Vision hints from a subset of frames
@@ -343,8 +344,19 @@ JSON you produced:
                 product_url_override=product_url_override.strip(),
                 ocr_hints=ocr_hints,
                 vision_hints=vision_hints,
-                max_results=8,
+                max_results=10,
             )
+
+            # Build an extra keyframe strip (6 evenly spaced frames)
+            if kfs:
+                step = max(1, len(kfs) // 6)
+                pick = kfs[::step][:6]
+                for item in pick:
+                    try:
+                        img = Image.open(item["image_path"]).convert("RGB")
+                    except Exception:
+                        img = Image.new("RGB", (1280, 720), color=(240, 240, 240))
+                    extra_strip_imgs.append((f"Ref @ {item['t']:.1f}s", img))
 
         st.subheader("Product Snapshot")
         if research["sources"]:
@@ -387,12 +399,11 @@ JSON you produced:
         if v:
             spec_bullets.append(f"{k.title()}: {v}")
 
-    # Prefer concrete features/specs first, then any short clean sentences
+    # Prefer concrete features/specs only (drop free-form 'claims' to avoid slogans)
     final_claims = _dedupe(
         (approved_claims_manual or [])
         + (research.get("features") or [])
         + spec_bullets
-        + (research.get("claims") or [])
     )
     final_disclaimers = _dedupe((required_disclaimers_manual or []) + (research.get("disclaimers") or []))
 
@@ -437,6 +448,7 @@ JSON you produced:
                 plan=script_json,
                 phase_images=imgs if 'imgs' in locals() else [],
                 research=research,
+                extra_keyframes=extra_strip_imgs,  # NEW: denser storyboard
             )
             st.subheader("Export PDF")
             st.download_button("⬇️ Download PDF", data=pdf_bytes, file_name=f"brief_{product}.pdf", mime="application/pdf")
