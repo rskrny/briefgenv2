@@ -29,7 +29,7 @@ def build_pdf(
     plan: Dict[str, Any],
     phase_images: List[Tuple[str, Image.Image]],
     research: Dict[str, Any] | None = None,
-    extra_keyframes: List[Tuple[str, Image.Image]] | None = None,  # NEW: denser storyboard
+    extra_keyframes: List[Tuple[str, Image.Image]] | None = None,
 ) -> bytes:
     """Return PDF bytes."""
     buf = BytesIO()
@@ -49,36 +49,51 @@ def build_pdf(
     c.showPage()
 
     # Product Snapshot
-    if research and (research.get("features") or research.get("specs") or research.get("claims") or research.get("disclaimers")):
+    if research:
         c.setFont("Helvetica-Bold", 16)
         c.drawString(margin, H - margin, "Product Snapshot")
         y = H - margin - 22
 
-        c.setFont("Helvetica", 11)
-        q = research.get("query", "")
-        if q:
-            y = _wrap(c, f"Query: {q}", margin, y, width_chars=100)
-            y -= 6
-
-        # Specs block
-        specs = research.get("specs") or {}
-        if specs:
+        # Verified specs
+        specs_d = research.get("specs_detailed") or []
+        if specs_d:
+            c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Specs (verified):"); y -= 14
+            c.setFont("Helvetica", 10)
+            for s in specs_d[:16]:
+                line = f"• {s.get('key','').title()}: {s.get('value','')}  (conf {s.get('confidence',0):.2f}, {len(s.get('sources',[]))} src)"
+                y = _wrap(c, line, margin + 10, y, width_chars=100)
+                if y < margin + 40:
+                    c.showPage(); y = H - margin
+                    c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Specs (verified, cont.)"); y -= 14
+                    c.setFont("Helvetica", 10)
+        elif research.get("specs"):
             c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Specs:"); y -= 14
             c.setFont("Helvetica", 10)
-            for k, v in list(specs.items())[:14]:
+            for k, v in list(research["specs"].items())[:16]:
                 y = _wrap(c, f"• {k.title()}: {v}", margin + 10, y, width_chars=100)
                 if y < margin + 40:
                     c.showPage(); y = H - margin
                     c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Specs (cont.)"); y -= 14
                     c.setFont("Helvetica", 10)
 
-        # Features
-        feats = research.get("features") or []
-        if feats:
+        # Verified features
+        feats_d = research.get("features_detailed") or []
+        if feats_d:
+            y -= 6
+            c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Features (verified):"); y -= 14
+            c.setFont("Helvetica", 10)
+            for f in feats_d[:18]:
+                line = f"• {f.get('text','')}  (conf {f.get('confidence',0):.2f}, {len(f.get('sources',[]))} src)"
+                y = _wrap(c, line, margin + 10, y, width_chars=100)
+                if y < margin + 40:
+                    c.showPage(); y = H - margin
+                    c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Features (verified, cont.)"); y -= 14
+                    c.setFont("Helvetica", 10)
+        elif research.get("features"):
             y -= 6
             c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Features:"); y -= 14
             c.setFont("Helvetica", 10)
-            for ft in feats[:18]:
+            for ft in research.get("features", [])[:18]:
                 y = _wrap(c, f"• {ft}", margin + 10, y, width_chars=100)
                 if y < margin + 40:
                     c.showPage(); y = H - margin
@@ -98,13 +113,13 @@ def build_pdf(
                     c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Disclaimers (cont.)"); y -= 14
                     c.setFont("Helvetica", 10)
 
-        # Sources
+        # Sources (top)
         srcs = research.get("sources") or []
         if srcs:
             y -= 6
             c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Sources:"); y -= 14
             c.setFont("Helvetica", 9)
-            for s in srcs[:8]:
+            for s in srcs[:10]:
                 title = s.get("title") or s.get("url") or ""
                 url = s.get("url") or ""
                 y = _wrap(c, f"• {title} — {url}", margin + 10, y, width_chars=110)
@@ -112,9 +127,10 @@ def build_pdf(
                     c.showPage(); y = H - margin
                     c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Sources (cont.)"); y -= 14
                     c.setFont("Helvetica", 9)
+
         c.showPage()
 
-    # Reference Keyframes (phases)
+    # Reference keyframes (by phase)
     if phase_images:
         c.setFont("Helvetica-Bold", 16)
         c.drawString(margin, H - margin, "Reference Keyframes (by phase)")
@@ -136,13 +152,12 @@ def build_pdf(
                 y -= (img_h + 36)
         c.showPage()
 
-    # Extra keyframe strip (denser storyboard)
+    # Additional frames (denser storyboard)
     if extra_keyframes:
         c.setFont("Helvetica-Bold", 16)
         c.drawString(margin, H - margin, "Additional Reference Frames")
         y = H - margin - 30
         cols = 3
-        pad = 10
         img_w = (W - (cols + 1) * margin) / cols
         img_h = img_w * 9 / 16
         for i, (label, img) in enumerate(extra_keyframes):
@@ -171,8 +186,7 @@ def build_pdf(
 
     for sc in (plan.get("script") or {}).get("scenes", []):
         if y < margin + 120:
-            c.showPage()
-            y = H - margin - 20
+            c.showPage(); y = H - margin - 20
         c.setFont("Helvetica-Bold", 12)
         c.drawString(margin, y, f"• Scene {sc.get('idx','')}  ({sc.get('start_s','')}–{sc.get('end_s','')}s)")
         y -= 14
