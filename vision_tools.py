@@ -6,19 +6,18 @@ from llm import gemini_json_from_images, openai_json_from_images
 VISION_PROMPT = """
 You are a product-visual analyst. Look at the images (keyframes from a short product video).
 Return JSON ONLY:
-
 {
-  "visible_features": ["short, product-agnostic bullets (≤7 words)"],
-  "category_tags": ["high-level product types (e.g., 'folding chair', 'headphones')"],
+  "visible_features": ["short, product-agnostic bullets (6–12 items, ≤7 words each)"],
+  "category_tags": ["1–3 high-level product types (e.g., 'folding chair','headphones')"],
   "materials_guess": ["aluminum","plastic","mesh","glass","leather", "..."],
   "avoid_claims": ["phrases to avoid if speculative"],
   "confidence": 0.0-1.0
 }
-
 Rules:
 - Only describe what can be reasonably inferred visually (parts, mechanisms, ports, controls, included accessories).
 - No performance metrics, no certifications, no '#1/best' superlatives.
 - Keep language universal; do not assume a brand or model.
+- Prefer nouns + attributes: e.g., "folding frame", "mesh seat", "USB-C port", "zippered pouch".
 """
 
 def infer_visual_features(image_paths: List[str], provider: str = "Gemini") -> Dict[str, Any]:
@@ -40,4 +39,7 @@ def infer_visual_features(image_paths: List[str], provider: str = "Gemini") -> D
     out["category_tags"] = [s.strip() for s in out["category_tags"] if isinstance(s, str) and s.strip()]
     out["materials_guess"] = [s.strip() for s in out["materials_guess"] if isinstance(s, str) and s.strip()]
     out["avoid_claims"] = [s.strip() for s in out["avoid_claims"] if isinstance(s, str) and s.strip()]
+    # hard floor
+    if len(out["visible_features"]) < 4:
+        out["visible_features"] += ["notable design feature"] * (4 - len(out["visible_features"]))
     return out
