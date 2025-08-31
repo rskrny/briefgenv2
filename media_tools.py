@@ -4,12 +4,15 @@
 # - grab_even_keyframes(video_path, every_s=2.5, limit=16) -> [{"t": float, "image_path": str}]
 # - frame_at_time(video_path, t_s) -> PIL.Image.Image
 # - transcribe_audio(video_path) -> str   (stub; returns "")
+# - download_video_from_url(url: str, tmp_dir: pathlib.Path, max_mb: int = 200) -> pathlib.Path
 
 from __future__ import annotations
 import os
+import io
 import math
 import tempfile
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -19,6 +22,12 @@ try:
     import cv2  # opencv-python-headless
 except Exception:
     cv2 = None
+
+# Requests is only used for direct media URLs (e.g., .mp4)
+try:
+    import requests
+except Exception:
+    requests = None
 
 
 # -----------------------------
@@ -94,7 +103,6 @@ def grab_even_keyframes(video_path: str, every_s: float = 2.5, limit: int = 16) 
         idx += 1
         t += max(0.5, float(every_s))
 
-    # If we got 0 (super short video), grab first frame
     if not out:
         img = _read_frame_at(cap, 0)
         path = os.path.join(tmp_dir, f"kf_00.jpg")
@@ -134,3 +142,81 @@ def transcribe_audio(video_path: str) -> str:
     The app treats empty transcript as SHOWCASE-friendly (minimal speech).
     """
     return ""
+
+
+# -----------------------------
+# Download via URL (TikTok/YouTube/Instagram/direct .mp4)
+# -----------------------------
+def _download_direct_file(url: str, tmp_dir: Path, max_mb: int = 200) -> Optional[Path]:
+    if requests is None:
+        return None
+    # Try to enforce size limits
+    try:
+        head = requests.head(url, timeout=10, allow_redirects=True)
+        size = int(head.headers.get("Content-Length", "0"))
+        if size and size > max_mb * 1024 * 1024:
+            raise RuntimeError(f"File too large (> {max_mb}MB).")
+    except Exception:
+        # If HEAD fails, continue; we'll stream with a cap
+        pass
+
+    fn = tmp_dir / "input.mp4"
+    try:
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            total = 0
+            with open(fn, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    total += len(chunk)
+                    if total > max_mb * 1024 * 1024:
+                        raise RuntimeError(f"Downloaded size exceeded {max_mb}MB cap.")
+        return fn
+    except Exception:
+        return None
+
+def download_video_from_url(url: str, tmp_dir: Path, max_mb: int = 200) -> Path:
+    """
+    Attempts to download a video from a URL. Supports:
+      - Direct media URLs (.mp4/.mov/.m4v/.webm)
+      - Pages (TikTok/YouTube/Instagram/etc.) via yt-dlp
+    Returns a local file path. Raises on failure.
+    """
+    url_lower = url.lower().strip()
+
+    # Direct media link?
+    if any(url_lower.endswith(ext) for ext in (".mp4", ".mov", ".m4v", ".webm", ".mpeg4")):
+        p = _download_direct_file(url, tmp_dir, max_mb=max_mb)
+        if p and p.exists():
+            return p
+        raise RuntimeError("Failed to download direct media file.")
+
+    # Use yt-dlp for page URLs
+    try:
+        from yt_dlp import YoutubeDL
+        outtmpl = str(tmp_dir / "input.%(ext)s")
+        ydl_opts = {
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "noprogress": True,
+            "nocheckcertificate": True,
+            "merge_output_format": "mp4",
+            "format": "mp4/bestvideo+bestaudio/best",
+            "retries": 2,
+            "fragment_retries": 2,
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            out_path = Path(ydl.prepare_filename(info))
+            # Prefer mp4 if merge produced it
+            mp4_path = out_path.with_suffix(".mp4")
+            if mp4_path.exists():
+                out_path = mp4_path
+            # Quick size cap check
+            if out_path.stat().st_size > max_mb * 1024 * 1024:
+                raise RuntimeError(f"Downloaded file exceeds {max_mb}MB.")
+            return out_path
+    except Exception as e:
+        raise RuntimeError(f"yt-dlp failed to fetch this URL: {e}")
