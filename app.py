@@ -1,41 +1,24 @@
 # app.py
-# Streamlit UI that:
-# 1) Accepts video via URL or file upload
-# 2) Analyzes the reference video (archetype-aware, evidence-first)
-# 3) Generates a creator-ready script JSON based on analyzer output
-# 4) (Optionally) builds a PDF via pdf_export if present
-
 from __future__ import annotations
-import os
-import json
-import tempfile
+import os, json, tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
-
+from typing import Any, Dict, List, Tuple
 import numpy as np
 import streamlit as st
 from PIL import Image
 
-# Local modules
 from llm import gemini_json, openai_json
 from media_tools import (
-    extract_duration,
-    grab_even_keyframes,
-    frame_at_time,
-    transcribe_audio,
-    download_video_from_url,
+    extract_duration, grab_even_keyframes, frame_at_time,
+    transcribe_audio, download_video_from_url,
 )
 from ocr_tools import ocr_images
 from validators import validate_analyzer_json, validate_script_json
 from prompts import (
-    build_analyzer_prompt_with_fewshots,
-    build_script_messages,
-    ANALYZER_SCHEMA_EXAMPLE,
-    ARCHETYPES,
-    ARCHETYPE_PHASES,
+    build_analyzer_prompt_with_fewshots, build_script_messages,
+    ANALYZER_SCHEMA_EXAMPLE, ARCHETYPES, ARCHETYPE_PHASES,
 )
 
-# Optional PDF export
 try:
     import pdf_export as pe
 except Exception:
@@ -43,9 +26,6 @@ except Exception:
 
 st.set_page_config(page_title="briefgenv2 — Analyzer v3", page_icon="🎬", layout="wide")
 
-# ------------------------------
-# Few-shot anchors (small, inline)
-# ------------------------------
 EXEMPLARS: List[Dict[str, Any]] = [
     {"name": "ASMR Unbox – Gadget", "archetype": "SHOWCASE",
      "mini_analysis": {"phases": [{"name":"Unbox"},{"name":"Handle/Features"},{"name":"Demo"},{"name":"Outro"}]}},
@@ -61,9 +41,6 @@ EXEMPLARS: List[Dict[str, Any]] = [
      "mini_analysis": {"phases": [{"name":"Setup"},{"name":"Test"},{"name":"Results"},{"name":"Takeaway"}]}},
 ]
 
-# ------------------------------
-# Lightweight feature helpers
-# ------------------------------
 def caption_density(ocr_frames: List[Dict[str,Any]]) -> float:
     if not ocr_frames: return 0.0
     total_lines = sum(len(f.get("lines", [])) for f in ocr_frames)
@@ -107,6 +84,31 @@ def motion_series(video_path: str, key_ts: List[float]) -> List[float]:
     mx = max(vals) or 1e-6
     return [v/mx for v in vals]
 
+def propose_scene_candidates(duration: float, key_ts: List[float], motion_vals: List[float],
+                             threshold: float = 0.45, min_len: float = 2.0) -> List[Dict[str,Any]]:
+    """Simple cut suggestions from motion jumps around keyframe times."""
+    if not key_ts:
+        # 3 equal segments if video is long enough
+        if duration >= 9.0:
+            thirds = [0.0, round(duration/3,2), round(2*duration/3,2), round(duration,2)]
+            return [{"start_s": thirds[i], "end_s": thirds[i+1], "why": "equal split"} for i in range(3)]
+        return [{"start_s": 0.0, "end_s": round(duration,2), "why": "whole clip"}]
+
+    cuts = [0.0]
+    for i in range(1, len(motion_vals)):
+        jump = abs(motion_vals[i] - motion_vals[i-1])
+        t_here = key_ts[i]
+        if jump >= threshold and (t_here - cuts[-1]) >= min_len:
+            cuts.append(round(t_here, 2))
+    if (duration - cuts[-1]) >= min_len:
+        cuts.append(round(duration, 2))
+    segs = []
+    for i in range(len(cuts)-1):
+        segs.append({"start_s": cuts[i], "end_s": cuts[i+1], "why": "motion jump" if i else "start"})
+    if not segs:
+        segs = [{"start_s": 0.0, "end_s": round(duration,2), "why": "whole clip"}]
+    return segs
+
 def save_upload(upload, tmp_dir: Path) -> Path:
     p = tmp_dir / upload.name
     with open(p, "wb") as f:
@@ -127,9 +129,6 @@ def images_for_display(video_path: str, phases: List[Dict[str,Any]]) -> List[Tup
         out.append((f"{name} @ {t:.1f}s", img))
     return out
 
-# ------------------------------
-# Sidebar settings
-# ------------------------------
 with st.sidebar:
     st.title("⚙️ Settings")
     provider = st.selectbox("Model Provider", ["Gemini", "OpenAI"], index=0)
@@ -143,9 +142,6 @@ with st.sidebar:
     pdf_brand = st.text_input("Brand Header", "BrandPal")
     pdf_footer = st.text_input("Footer Note", "Generated with briefgenv2")
 
-# ------------------------------
-# Main form
-# ------------------------------
 st.title("📽️ briefgenv2 — Analyzer v3")
 
 colA, colB = st.columns(2)
@@ -170,13 +166,8 @@ st.markdown("#### Optional: Claims & Disclaimers")
 approved_claims = st.text_area("Approved Claims (one per line)", value="").strip().splitlines()
 required_disclaimers = st.text_area("Required Disclaimers (one per line)", value="").strip().splitlines()
 
-# ------------------------------
-# Pipeline
-# ------------------------------
 if run_btn:
     tmp_dir = Path(tempfile.mkdtemp())
-
-    # 1) Resolve source to local file
     try:
         if video_url:
             with st.spinner("Fetching video from URL…"):
@@ -188,23 +179,21 @@ if run_btn:
         st.error(f"Could not retrieve the video: {e}")
         st.stop()
 
-    # 2) Evidence extraction
     with st.spinner("Extracting keyframes & OCR…"):
         duration = extract_duration(str(video_path)) or 0.0
-        kfs = grab_even_keyframes(str(video_path), every_s=2.5, limit=16)
+        kfs = grab_even_keyframes(str(video_path), every_s=2.0, limit=18)
         key_ts = [x["t"] for x in kfs]
         ocr = ocr_images(kfs)
         cap_den = caption_density(ocr)
         transcript = transcribe_audio(str(video_path)) or ""
         sp_ratio = speech_proxy(transcript, cap_den)
-        cuts = cut_density_from_keyframes(key_ts)
         motion_vals = motion_series(str(video_path), key_ts)
-        motion_mean = float(np.mean(motion_vals)) if motion_vals else 0.0
+        scene_cands = propose_scene_candidates(duration, key_ts, motion_vals)
+        cuts = cut_density_from_keyframes(key_ts)
 
         keyframes_meta = [{"t": round(x["t"],2), "ref": f"kf@{round(x['t'],2)}"} for x in kfs]
         ocr_frames = [{"t": round(f["t"],2), "lines": f.get("lines", [])[:3]} for f in ocr]
 
-    # 3) Analyze
     with st.spinner("Analyzing reference video (archetype-aware)…"):
         analyzer_prompt = build_analyzer_prompt_with_fewshots(
             platform=platform,
@@ -217,20 +206,20 @@ if run_btn:
             grammar_table=ARCHETYPE_PHASES,
             fewshots=EXEMPLARS,
             schema_example=ANALYZER_SCHEMA_EXAMPLE,
+            scene_candidates=scene_cands,
         )
         analysis = gemini_json(analyzer_prompt) if provider == "Gemini" else openai_json(analyzer_prompt)
 
-        # Attach derived signals if missing
+        # Fill missing signals
         analysis.setdefault("video_metadata", {})
         analysis["video_metadata"].setdefault("duration_s", duration)
         analysis["video_metadata"].setdefault("aspect_ratio", "9:16")
         analysis.setdefault("global_signals", {})
-        if "speech_presence" not in analysis["global_signals"]:
-            analysis["global_signals"]["speech_presence"] = (
-                "none" if sp_ratio < 0.15 else ("low" if sp_ratio < 0.35 else ("medium" if sp_ratio < 0.7 else "high"))
-            )
-        if "tempo" not in analysis["global_signals"]:
-            analysis["global_signals"]["tempo"] = "calm" if cuts < 0.22 else ("moderate" if cuts < 0.5 else "fast")
+        analysis["global_signals"].setdefault(
+            "speech_presence",
+            "none" if sp_ratio < 0.15 else ("low" if sp_ratio < 0.35 else ("medium" if sp_ratio < 0.7 else "high"))
+        )
+        analysis["global_signals"].setdefault("tempo", "calm" if cuts < 0.22 else ("moderate" if cuts < 0.5 else "fast"))
 
         issues = validate_analyzer_json(analysis)
         if issues:
@@ -242,38 +231,49 @@ JSON you produced:
 """
             analysis = gemini_json(fix_prompt) if provider == "Gemini" else openai_json(fix_prompt)
 
+        # Fallback: if SHOWCASE and model returned ≤1 phase for a clip ≥10s, create 2–3 coarse phases from scene_candidates
+        arch = analysis.get("archetype") or analysis.get("analysis", {}).get("archetype", "")
+        phases = analysis.get("phases") or analysis.get("analysis", {}).get("phases", [])
+        if arch == "SHOWCASE" and duration >= 10 and len(phases) <= 1:
+            segs = scene_cands[:3] if len(scene_cands) >= 2 else [{"start_s":0.0,"end_s":duration,"why":"whole clip"}]
+            names = ["Unbox", "Handle/Features", "Demo", "Outro"]
+            fallback_phases = []
+            for i, seg in enumerate(segs):
+                nm = names[min(i, len(names)-1)]
+                fallback_phases.append({
+                    "phase": nm,
+                    "start_s": seg["start_s"],
+                    "end_s": seg["end_s"],
+                    "what_happens": "visible action per segment",
+                    "camera_notes": "",
+                    "audio_notes": "silent",
+                    "on_screen_text": "",
+                    "evidence": [f"kf@{round((seg['start_s']+seg['end_s'])/2,2)}"]
+                })
+            analysis["phases"] = fallback_phases
+
     st.success("Analysis complete.")
     with st.expander("Analyzer JSON", expanded=True):
         st.json(analysis)
 
-    # Signals
     st.subheader("Analyzer Signals")
     gs = analysis.get("global_signals", {})
     arch = analysis.get("archetype") or analysis.get("analysis", {}).get("archetype", "")
     st.write(f"**Archetype:** {arch or '(see JSON)'}")
     st.write(f"**Speech presence:** {gs.get('speech_presence','?')}  |  **Tempo:** {gs.get('tempo','?')}")
 
-    # Phase previews
     try:
         phases = analysis.get("phases") or analysis.get("analysis", {}).get("phases", [])
-        imgs: List[Tuple[str, Image.Image]] = []
-        for ph in (phases or [])[:8]:
-            name = ph.get("phase") or ph.get("name") or "Phase"
-            stt = ph.get("start_s") or 0.0
-            end = ph.get("end_s") or stt
-            t = (stt + end) / 2.0 if end > stt else stt
-            img = frame_at_time(str(video_path), float(t))
-            imgs.append((f"{name} @ {t:.1f}s", img))
+        imgs: List[Tuple[str, Image.Image]] = images_for_display(str(video_path), phases)
         if imgs:
             st.subheader("Reference Keyframes")
             cols = st.columns(min(3, len(imgs)))
             for i, (label, img) in enumerate(imgs):
                 with cols[i % len(cols)]:
-                    st.image(img, caption=label, use_column_width=True)
+                    st.image(img, caption=label, use_container_width=True)
     except Exception as e:
         st.warning(f"Could not render phase keyframes: {e}")
 
-    # 4) Script generation
     with st.spinner("Generating script & shot list…"):
         script_prompt = build_script_messages(
             analyzer_json=analysis,
@@ -300,20 +300,32 @@ JSON you produced:
     with st.expander("Script JSON", expanded=True):
         st.json(script_json)
 
-    # 5) Optional PDF
     if pe is not None:
         try:
+            # Prefer build_pdf if present; otherwise, try legacy names.
+            if hasattr(pe, "build_pdf"):
+                pdf_bytes: bytes = pe.build_pdf(
+                    brand_header=pdf_brand,
+                    footer_note=pdf_footer,
+                    product_meta={"brand": brand, "name": product, "platform": platform},
+                    analysis=analysis,
+                    plan=script_json,
+                    phase_images=imgs if 'imgs' in locals() else [],
+                )
+            elif hasattr(pe, "create_pdf"):
+                pdf_bytes = pe.create_pdf(
+                    brand_header=pdf_brand,
+                    footer_note=pdf_footer,
+                    product_meta={"brand": brand, "name": product, "platform": platform},
+                    analysis=analysis,
+                    plan=script_json,
+                    phase_images=imgs if 'imgs' in locals() else [],
+                )
+            else:
+                raise AttributeError("pdf_export has no build_pdf/create_pdf")
             st.subheader("Export PDF")
-            pdf_bytes: bytes = pe.build_pdf(
-                brand_header=pdf_brand,
-                footer_note=pdf_footer,
-                product_meta={"brand": brand, "name": product, "platform": platform},
-                analysis=analysis,
-                plan=script_json,
-                phase_images=[],  # pass if your pdf_export expects images
-            )
             st.download_button("⬇️ Download PDF", data=pdf_bytes, file_name=f"brief_{product}.pdf", mime="application/pdf")
         except Exception as e:
-            st.info(f"PDF export skipped (pdf_export.build_pdf not available or different signature): {e}")
+            st.info(f"PDF export skipped: {e}")
     else:
         st.info("PDF export module not found. Skipping PDF creation.")
