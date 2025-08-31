@@ -81,8 +81,9 @@ def _ddg_search_multi(queries: List[str], max_results: int = 10) -> List[Dict[st
     hits=[]
     try:
         with DDGS() as ddgs:
+            per = max(2, max_results // max(1, len(queries)))
             for q in queries:
-                for r in ddgs.text(q, max_results=max_results//len(queries) or 3):
+                for r in ddgs.text(q, max_results=per):
                     url=r.get("href") or r.get("url"); title=r.get("title") or r.get("body") or url
                     if not url: continue
                     hits.append({"title": title, "url": url})
@@ -106,6 +107,29 @@ def _fetch_html(url: str, timeout: int = 12) -> Optional[str]:
         return r.text
     except Exception:
         return None
+
+# -------------------- Page scoring --------------------
+PRODUCT_URL_HINTS = ("/product/", "/products/", "/p/", "/dp/", "/sku/", "/item/")
+
+DROP_HTML_HINTS = r"(sitewide|newsletter|subscribe|privacy|terms|homepage|careers|press)"
+
+def _score_page(url: str, title: str, html: str, product_name: str) -> float:
+    score = 0.0
+    low_url = url.lower()
+    low_title = (title or "").lower()
+    # 1) URL hints
+    if any(h in low_url for h in PRODUCT_URL_HINTS):
+        score += 2.0
+    # 2) Title contains product name tokens
+    tokens = [t for t in product_name.lower().split() if len(t) >= 3]
+    score += sum(0.4 for t in tokens if t in low_title)
+    # 3) Obvious product signals in HTML
+    if "schema.org/Product" in html: score += 2.0
+    if re.search(r"(add\s+to\s+cart|buy\s+now|sku|model\s*:)", html, re.I): score += 1.2
+    # 4) Penalize homepage/nav pages
+    if re.search(DROP_HTML_HINTS, html, re.I):
+        score -= 1.5
+    return score
 
 # -------------------- HTML parsing --------------------
 def _jsonld_blocks(html: str) -> List[dict]:
@@ -192,6 +216,11 @@ SPEC_PATTERNS = [
     ("power", r"(?:^|\b)(?:power|wattage|output)[:\s-]*([\d\.]+)\s*(w|kw|v|volts|amps|a)\b"),
     ("screen", r"(?:^|\b)(?:screen|display|resolution)[:\s-]*([\d]{3,4}\s?[x×]\s?[\d]{3,4}|[\d\.]+\s?(?:in|inch|\"))"),
     ("ip_rating", r"\bip\s?([0-9]{2})\b"),
+    # Outdoor / hard-goods extras
+    ("load_capacity", r"(?:max(?:imum)?\s+)?(?:load|weight)\s+capacit(?:y|ies)[:\s-]*([\d\.]+)\s*(lb|lbs|pounds|kg)"),
+    ("packed_size", r"(?:packed\s*(?:size|dimensions))[:\s-]*([\d\.\sx×x]+)\s*(cm|mm|in|\"|')?"),
+    ("seat_height", r"(?:seat\s*height)[:\s-]*([\d\.]+)\s*(cm|mm|in|\"|')"),
+    ("materials", r"(?:materials?)[:\s-]*([a-z0-9,\s\-\/\+]+)"),
 ]
 
 def _extract_specs_from_lines(lines: List[str]) -> Dict[str,str]:
@@ -204,12 +233,40 @@ def _extract_specs_from_lines(lines: List[str]) -> Dict[str,str]:
                 specs[key]=" ".join([x for x in m.groups() if x]).strip()
     return specs
 
+# ---------- Feature/claim sanitation ----------
+DROP_PATTERNS = [
+    r"\b(terms of service|privacy policy|warranty|care and repair|gear trade in)\b",
+    r"\b(newsletter|subscribe|promotions|inventory alerts|join|homepage|careers|press)\b",
+    r"\b(adventure anywhere|adventure for anyone|adventure forever|beginner to expert)\b",
+    r"^where to next\??$",
+    r"^purchase with purpose$",
+]
+
+PRODUCT_TOKENS = [
+    "frame","seat","fabric","mesh","strap","pocket","zipper","leg","foot","arm",
+    "hinge","case","bag","port","button","switch","sensor","battery","blade",
+    "panel","lens","mount","rail","hood","pouch","cup","holder","stand","grip",
+    "sole","midsole","outsole","hood","drawcord","vent","nozzle","filters","filter"
+]
+
+def _looks_like_feature(line: str) -> bool:
+    low = line.lower().strip("•-: ").strip()
+    if "®" in low or "™" in low:  # avoid slogans with marks
+        return False
+    if any(re.search(p, low) for p in DROP_PATTERNS):
+        return False
+    if not (3 <= len(low.split()) <= 10):
+        return False
+    if not any(t in low for t in PRODUCT_TOKENS):
+        return False
+    if not _looks_safe(low):
+        return False
+    return True
+
 def _extract_features_from_lines(lines: List[str]) -> List[str]:
     feats=[]
     for ln in lines:
-        if not _looks_safe(ln): continue
-        # prefer bullets / short phrases
-        if _short_enough(ln, 12):
+        if _looks_like_feature(ln):
             feats.append(ln.strip("•-: ").strip())
     return _dedupe(feats)
 
@@ -231,7 +288,7 @@ You extract product information from noisy web copy.
 Return JSON ONLY:
 {{
   "features": ["≤12 short bullets, product-agnostic, no superlatives"],
-  "specs": {{"weight":"","dimensions":"","capacity":"","battery_life":"","power":"","screen":"","ip_rating":""}},
+  "specs": {{"weight":"","dimensions":"","capacity":"","battery_life":"","power":"","screen":"","ip_rating":"","load_capacity":"","packed_size":"","seat_height":"","materials":""}},
   "disclaimers": ["0–6 short safety/usage disclaimers"]
 }}
 Constraints:
@@ -277,17 +334,24 @@ def research_product(
     else:
         urls=_ddg_search_multi([q0,q1,q2], max_results=max_results)
 
-    # Parse pages
-    all_lines=[]; jsonld_features=[]; jsonld_specs={}
+    # Fetch + score pages
+    candidates=[]
     for h in urls:
         html=_fetch_html(h["url"])
-        if not html: continue
+        if not html: 
+            continue
+        s = _score_page(h["url"], h.get("title",""), html, f"{brand} {product}")
+        candidates.append((s, h, html))
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
+    # Parse pages in ranked order
+    all_lines=[]; jsonld_features=[]; jsonld_specs={}
+    for s, h, html in candidates:
         jsonlds=_jsonld_blocks(html)
         f2, s2 = _from_jsonld(jsonlds)
         jsonld_features.extend(f2)
         jsonld_specs.update({k.lower():v for k,v in s2.items()})
         lines=_texts_from_dom(html)
-        # keep English-ish text only
         lines=[ln for ln in lines if _lang_ok(ln)]
         all_lines.extend(lines)
 
@@ -306,19 +370,21 @@ def research_product(
             if v and k not in specs: specs[k]=v
         discls=_dedupe(discls + (llm_out.get("disclaimers") or []))
 
-    # Final floor using hints
+    # Final floor using hints — guarantee ≥4 bullets
     floor_feats=_dedupe((feats or []) + (vision_hints or []) + (ocr_hints or []))
     while len(floor_feats) < 4:
         floor_feats.append("notable design feature")
     feats=floor_feats[:20]
 
-    claims=[ln for ln in all_lines if _looks_safe(ln) and _short_enough(ln, 16)][:20]
+    # Clean sentences (optional; NOT used to script now)
+    claims=[ln for ln in all_lines if _looks_safe(ln) and _short_enough(ln, 14)]
+    claims=_dedupe([c for c in claims if _looks_like_feature(c)])  # extra safety
 
     bundle.update({
-        "sources": urls,
+        "sources": [h for _,h,_ in candidates] if candidates else urls,
         "features": feats,
         "specs": specs,
         "disclaimers": discls[:10],
-        "claims": claims,
+        "claims": claims[:20],
     })
     return bundle
