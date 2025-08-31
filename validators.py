@@ -1,97 +1,130 @@
 # validators.py
-# Lightweight validators to enforce structure + timing + content constraints.
+# Archetype-aware validators to enforce structure without forcing narrative phases.
 
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
-REQUIRED_PHASES = ["hook", "pain_point", "solution", "proof", "cta"]
+def _f(x) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
 
-def _f(x):
-    try: return float(x)
-    except Exception: return None
+def _non_empty_str(s) -> bool:
+    return isinstance(s, str) and len(s.strip()) > 0
 
+# -------------------------------
+# Analyzer JSON validator
+# -------------------------------
 def validate_analyzer_json(j: Dict[str, Any]) -> List[str]:
     errs: List[str] = []
-    # Narrative phases
-    phases = [p.get("phase") for p in j.get("narrative", []) if isinstance(p, dict)]
-    if not phases:
-        errs.append("Missing 'narrative'.")
+
+    # Basics
+    vm = j.get("video_metadata", {})
+    if not isinstance(vm, dict):
+        errs.append("Missing 'video_metadata'.")
     else:
-        for req in REQUIRED_PHASES:
-            if req not in phases:
-                errs.append(f"Missing narrative phase: {req}.")
-    # Scenes
-    scenes = j.get("scenes", [])
-    if not scenes:
-        errs.append("Missing 'scenes'.")
+        dur = _f(vm.get("duration_s"))
+        if dur is None or dur < 0:
+            errs.append("Invalid 'video_metadata.duration_s'.")
+        ar = vm.get("aspect_ratio")
+        if not _non_empty_str(ar):
+            errs.append("Missing 'video_metadata.aspect_ratio'.")
+
+    gs = j.get("global_signals", {})
+    if not isinstance(gs, dict):
+        errs.append("Missing 'global_signals'.")
     else:
-        prev_end = 0.0
-        start_seen = False
-        for s in scenes:
-            st = _f(s.get("start_s")); en = _f(s.get("end_s"))
-            if st is None or en is None or en <= st:
-                errs.append(f"Scene {s.get('idx')} invalid start/end.")
-                continue
-            if not start_seen and abs(st - 0.0) > 0.6:
-                errs.append("Scenes do not start at 0.0s.")
-            start_seen = True
-            if abs(st - prev_end) > 0.6:
-                errs.append(f"Non-contiguous timing at scene {s.get('idx')} (start {st}, prev_end {prev_end}).")
-            prev_end = en
-            # Must have transition and sfx
-            if not s.get("transition_out"):
-                errs.append(f"Scene {s.get('idx')} missing transition_out.")
-            if not s.get("sfx_or_music"):
-                errs.append(f"Scene {s.get('idx')} missing sfx_or_music.")
-            # OSD max 2
-            txt = s.get("on_screen_text", [])
-            if isinstance(txt, list) and len(txt) > 2:
-                errs.append(f"Scene {s.get('idx')} has >2 on_screen_text lines.")
-    # Keyframes
-    kfs = j.get("keyframes", [])
-    if not kfs:
-        errs.append("Missing 'keyframes'.")
+        sp = gs.get("speech_presence")
+        if sp not in {"none", "low", "medium", "high"}:
+            errs.append("global_signals.speech_presence must be one of none|low|medium|high.")
+
+    arch = j.get("archetype")
+    if arch not in {
+        "SHOWCASE","NARRATIVE","TUTORIAL","COMPARISON","TEST_DEMO","TESTIMONIAL_UGC","TIMELAPSE","ANNOUNCEMENT"
+    }:
+        errs.append("Invalid or missing 'archetype'.")
+
+    conf = j.get("confidence")
+    if conf is None or not (0.0 <= float(conf) <= 1.0):
+        errs.append("Missing/invalid 'confidence' in [0,1].")
+
+    # Phases
+    phases = j.get("phases", [])
+    if not isinstance(phases, list):
+        errs.append("Missing 'phases' (list).")
+        phases = []
+
+    # Archetype-specific checks (no forced narrative for showcase)
+    if arch == "SHOWCASE":
+        # Allow empty if the video is too short, but warn if totally empty
+        if not phases:
+            errs.append("SHOWCASE: no phases found (expected Unbox/Handle/Features/Demo/Outro if present).")
     else:
-        for k in kfs:
-            if not k.get("image_ref"):
-                errs.append("Keyframe missing image_ref.")
-            if not k.get("why"):
-                errs.append("Keyframe missing 'why'.")
-    # Influencer DNA / edit grammar
-    dna = j.get("influencer_DNA", {})
-    if not dna or not dna.get("edit_grammar") or not dna.get("retention_devices"):
-        errs.append("Missing influencer_DNA/edit_grammar/retention_devices.")
+        if not phases:
+            errs.append(f"{arch}: 'phases' should not be empty.")
+
+    # Phase time sanity & ordering
+    prev_end = -1.0
+    for i, p in enumerate(phases, start=1):
+        st = _f(p.get("start_s"))
+        en = _f(p.get("end_s"))
+        if st is not None and en is not None:
+            if en <= st:
+                errs.append(f"Phase {i} has invalid start/end (end <= start).")
+            if prev_end >= 0 and st < prev_end - 0.25:
+                errs.append(f"Phase {i} starts before previous phase ends (overlap).")
+            prev_end = en if en is not None else prev_end
+
+    # Visible features (optional but should be list if present)
+    vf = j.get("visible_product_features", [])
+    if vf and not isinstance(vf, list):
+        errs.append("'visible_product_features' must be a list.")
+
     return errs
 
+
+# -------------------------------
+# Script JSON validator
+# -------------------------------
 def validate_script_json(j: Dict[str, Any], target_runtime_s: float) -> List[str]:
     errs: List[str] = []
-    scr = j.get("script", {})
-    scenes = scr.get("scenes", [])
-    if not scenes:
-        errs.append("Script scenes empty.")
+
+    script = j.get("script")
+    if not isinstance(script, dict):
+        errs.append("Missing 'script' object.")
         return errs
-    # contiguous timing + runtime envelope
-    prev_end = 0.0
-    for s in scenes:
+
+    scenes = script.get("scenes", [])
+    if not isinstance(scenes, list) or not scenes:
+        errs.append("Missing 'script.scenes' (non-empty list).")
+        return errs
+
+    # Timing sanity and approximate coverage
+    first = scenes[0]
+    st0 = _f(first.get("start_s"))
+    if st0 is None or st0 > 0.75:
+        errs.append("First scene should start near 0.0s (≤0.75s).")
+
+    prev_end = None
+    for i, s in enumerate(scenes, start=1):
         st = _f(s.get("start_s")); en = _f(s.get("end_s"))
         if st is None or en is None or en <= st:
-            errs.append(f"Scene {s.get('idx')} invalid start/end.")
-            continue
-        if abs(st - prev_end) > 0.6:  # small drift allowed
-            errs.append(f"Non-contiguous timing at scene {s.get('idx')} (start {st}, prev_end {prev_end}).")
+            errs.append(f"Scene {i} invalid start/end.")
+        if prev_end is not None and (st - prev_end) > 1.0:
+            errs.append(f"Scene {i} has a large gap from previous scene (>1s).")
         prev_end = en
-        # Require transition + sfx
-        if not s.get("transition_out"):
-            errs.append(f"Scene {s.get('idx')} missing transition_out.")
-        if not s.get("sfx_or_music"):
-            errs.append(f"Scene {s.get('idx')} missing sfx_or_music.")
-        # OSD max 2
-        txt = s.get("on_screen_text", [])
-        if isinstance(txt, list) and len(txt) > 2:
-            errs.append(f"Scene {s.get('idx')} has >2 on_screen_text lines.")
-    if abs(prev_end - float(target_runtime_s)) > 1.0:
-        errs.append(f"Total runtime {prev_end:.2f}s differs from target {target_runtime_s:.2f}s by >1s.")
-    # Style-transfer mapping presence
-    st_map = j.get("style_transfer", {}).get("affordance_map", [])
-    if not st_map:
-        errs.append("Missing style_transfer.affordance_map.")
+
+        # Basic content checks
+        if not _non_empty_str(s.get("action", "")):
+            errs.append(f"Scene {i} missing 'action'.")
+        # OSD ≤ 2 lines if present
+        osd = s.get("on_screen_text", [])
+        if osd and len(osd) > 2:
+            errs.append(f"Scene {i} has more than 2 on_screen_text lines.")
+
+    # End near target
+    end_last = _f(scenes[-1].get("end_s"))
+    if end_last is not None and abs(end_last - float(target_runtime_s)) > 2.0:
+        errs.append("Last scene end_s should be close to target_runtime_s (±2s).")
+
     return errs
