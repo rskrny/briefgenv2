@@ -1,56 +1,71 @@
 # ocr_tools.py
-# Tesseract OCR with simple denoise and confidence filtering
+# Minimal OCR utility used by app.py:
+#   ocr_images(keyframes) -> [{"t": float, "lines": [str, ...], "image_path": str}]
+#
+# - If Tesseract (pytesseract) is available, we OCR each keyframe.
+# - If not, we return empty lines (graceful fallback).
 
 from __future__ import annotations
-from typing import List, Dict
+from typing import List, Dict, Any
 
-import cv2
-import numpy as np
-import pytesseract
+import os
+from PIL import Image
 
-def _preprocess(img):
-    # grayscale → light denoise → slight threshold to improve text extraction
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 5, 35, 35)
-    # adaptive threshold helps on mixed overlays
-    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 35, 11)
-    return th
+# Try to import pytesseract (Python wrapper). If not installed or binary missing,
+# we'll fall back to no-OCR mode.
+try:
+    import pytesseract  # requires the Tesseract binary in PATH to actually work
+    _HAS_TESS = True
+except Exception:
+    pytesseract = None
+    _HAS_TESS = False
 
-def ocr_keyframes(frames: List[Dict]) -> List[Dict]:
+
+def _ocr_lines_pytesseract(img: Image.Image) -> List[str]:
     """
-    frames: [{"t": 0.0, "path": ".../kf_01.jpg"}, ...]
-    returns: [{"t": 0.0, "text": ["SALE 20% OFF","Tap to shop"], "image_path": "..."}]
+    OCR using pytesseract. Returns a few clean, short lines.
+    If pytesseract is present but the Tesseract binary is missing, this will raise.
+    We catch it in the caller and degrade gracefully.
     """
-    results: List[Dict] = []
-    for fr in frames:
-        path = fr["path"]
-        t = float(fr["t"])
-        img = cv2.imread(path)
-        if img is None:
-            results.append({"t": t, "text": [], "image_path": path})
-            continue
-        proc = _preprocess(img)
+    raw = pytesseract.image_to_string(img)  # simple & robust
+    lines = [ln.strip() for ln in raw.splitlines()]
+    # Keep only non-empty, short-ish lines to avoid junk
+    lines = [ln for ln in lines if ln and len(ln) <= 60]
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for ln in lines:
+        if ln.lower() not in seen:
+            seen.add(ln.lower())
+            out.append(ln)
+    # Limit to a few lines to save tokens
+    return out[:4]
 
-        data = pytesseract.image_to_data(proc, output_type=pytesseract.Output.DICT)
-        words = []
-        for txt, conf in zip(data["text"], data["conf"]):
+
+def ocr_images(keyframes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    keyframes: [{"t": float, "image_path": str}, ...]
+    returns:   [{"t": float, "lines": [str,...], "image_path": str}, ...]
+    """
+    results: List[Dict[str, Any]] = []
+    for kf in keyframes:
+        t = float(kf.get("t", 0.0))
+        path = kf.get("image_path", "")
+        lines: List[str] = []
+
+        if _HAS_TESS and path and os.path.exists(path):
             try:
-                c = float(conf)
+                with Image.open(path) as img:
+                    # Optional pre-processing for better OCR on captions:
+                    # convert to grayscale & raise contrast a bit
+                    img = img.convert("L")
+                    lines = _ocr_lines_pytesseract(img)
             except Exception:
-                c = -1
-            if c >= 55 and txt and txt.strip():
-                words.append(txt.strip())
-        # Merge to short lines (rough heuristic)
-        text = []
-        if words:
-            buff = []
-            for w in words:
-                buff.append(w)
-                if len(" ".join(buff)) > 26:  # keep lines short for overlays
-                    text.append(" ".join(buff))
-                    buff = []
-            if buff:
-                text.append(" ".join(buff))
-        results.append({"t": round(t, 3), "text": text, "image_path": path})
+                # Any failure -> fall back to no text
+                lines = []
+        else:
+            # No OCR available in this environment -> empty lines
+            lines = []
+
+        results.append({"t": t, "lines": lines, "image_path": path})
     return results
