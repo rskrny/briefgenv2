@@ -9,3 +9,4 @@ google-generativeai
 requests
 readability-lxml
 beautifulsoup4
+openai>=1.40
