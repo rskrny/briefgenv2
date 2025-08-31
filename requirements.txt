@@ -10,3 +10,4 @@ requests
 readability-lxml
 beautifulsoup4
 openai>=1.40
+duckduckgo-search>=6.2.10
