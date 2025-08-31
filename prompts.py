@@ -25,8 +25,6 @@ ANALYZER_SCHEMA_EXAMPLE: Dict[str, Any] = {
     "confidence": 0.86,
 
     # Phases are dependent on archetype and should only include what truly exists.
-    # SHOWCASE examples: Unbox, Handle/Features, Demo, Outro
-    # NARRATIVE examples: Hook, Problem, Solution, Proof, CTA
     "phases": [
         {
             "phase": "Unbox|Handle/Features|Demo|Outro|Hook|Problem|Solution|Proof|CTA|Step 1|Step 2|Comparison Setup|Side-by-side Test|Result|Setup|Test|Takeaway|Context|Key Info|How to Act|Reveal|Progress",
@@ -46,18 +44,18 @@ ANALYZER_SCHEMA_EXAMPLE: Dict[str, Any] = {
         {"t_s": 16.0, "image_ref": "kf_03.jpg", "why": "stability demo"}
     ],
 
-    "visible_product_features": ["folding frame","quick-fold latch","cup holder","carry bag"],
+    "visible_product_features": [],
 
     "compliance": {
         "sensitive_claims_detected": [],
-        "notes": "no medical claims; no certifications"
+        "notes": ""
     },
 
     "influencer_DNA": {
-        "persona": "hands-only; no dialogue",
-        "pacing": "calm",
-        "visual_motifs": ["macro texture", "slow pans"],
-        "edit_habits": ["hard cuts", "minimal captions"]
+        "persona": "",
+        "pacing": "",
+        "visual_motifs": [],
+        "edit_habits": []
     }
 }
 
@@ -90,12 +88,14 @@ def build_analyzer_prompt_with_fewshots(
     grammar_table: Dict[str, List[str]] = ARCHETYPE_PHASES,
     fewshots: List[Dict[str, Any]] = [],
     schema_example: Dict[str, Any] = ANALYZER_SCHEMA_EXAMPLE,
+    scene_candidates: List[Dict[str, Any]] = None,
 ) -> str:
     """
     Build a *single* JSON-only prompt for the analyzer.
     - fewshots: a short list of exemplars (name, archetype, mini_analysis)
     - keyframes_meta: [{"t": 9.2, "ref": "kf@9.2"}, ...]
     - ocr_frames: [{"t": 9.2, "lines": ["...","..."]}, ...]
+    - scene_candidates: [{"start_s":..., "end_s":..., "why":"motion jump"}, ...]
     """
     payload = {
         "platform": platform,
@@ -107,13 +107,13 @@ def build_analyzer_prompt_with_fewshots(
         "archetype_menu": archetype_menu,
         "grammar": grammar_table,
         "fewshots": [
-            # keep each fewshot compact
             {
                 "name": fs.get("name",""),
                 "archetype": fs.get("archetype",""),
                 "mini_analysis": fs.get("mini_analysis", {}),
             } for fs in (fewshots or [])
-        ]
+        ],
+        "scene_candidates": scene_candidates or []
     }
 
     return f"""
@@ -121,12 +121,14 @@ You are a director-level analyst for short-form video (TikTok/Reels/Shorts).
 Return JSON ONLY that matches the provided schema exactly. Do not include commentary.
 
 GUIDANCE:
-- First, infer 'speech_presence' from transcript_text length and OCR caption density.
+- Infer 'speech_presence' from transcript length + OCR caption density.
 - Choose exactly one 'archetype' from 'archetype_menu'.
 - Only include phases valid for that archetype (see 'grammar').
-- Reference specific evidence for each phase (e.g., "kf@9.2", "ocr@'Quick-fold latch'").
-- Prefer omission over hallucination. If uncertain, leave a phase out.
-- Use 'fewshots' as style anchors when similar; do not copy text—only structure/timing ideas.
+- Use 'scene_candidates' as coarse cut suggestions. ALIGN your phase start/end to these when reasonable.
+- SHOWCASE segmentation guidance (no speech):
+  * If duration ≥ 10s, prefer 2–4 phases (e.g., Unbox → Handle/Features → Demo → Outro) rather than one giant phase.
+  * Only output a single phase if the video truly has no discernible internal beats; if you do, lower 'confidence' to ≤ 0.6.
+- For each phase, include specific 'evidence' refs (e.g., "kf@9.2", "ocr@'Quick-fold latch'"). Prefer omission over hallucination.
 
 EVIDENCE (JSON):
 {json.dumps(payload, ensure_ascii=False)}
@@ -148,7 +150,6 @@ SCRIPT_SCHEMA_EXAMPLE: Dict[str, Any] = {
         "affordance_map": [{"from": "orig action", "to": "new product action"}],
     },
     "script": {
-        # In SHOWCASE, opening_hook may be empty.
         "opening_hook": "Optional quick line or empty for showcase.",
         "scenes": [
             {
@@ -185,16 +186,6 @@ def build_script_messages(
     platform: str,
     brand_voice: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """
-    Build a JSON-only script-generation prompt that performs style transfer using Analyzer output.
-    Archetype-aware:
-      - If archetype=SHOWCASE or speech_presence is none/low:
-          * Do NOT invent Problem/Solution.
-          * Voiceover is optional (0–2 very short lines total).
-          * Focus on visual actions that mirror reference phases (Unbox → Handle/Features → Demo → Outro).
-      - If NARRATIVE/TUTORIAL/COMPARISON/etc.: Only include phases supported by the analyzer's phases (or OCR/ASR evidence).
-    Also enforces claim safety (approved_claims only).
-    """
     voice = brand_voice or {}
     scaffold = {
         "brand": brand,
