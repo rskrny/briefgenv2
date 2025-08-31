@@ -29,6 +29,7 @@ def build_pdf(
     plan: Dict[str, Any],
     phase_images: List[Tuple[str, Image.Image]],
     research: Dict[str, Any] | None = None,
+    extra_keyframes: List[Tuple[str, Image.Image]] | None = None,  # NEW: denser storyboard
 ) -> bytes:
     """Return PDF bytes."""
     buf = BytesIO()
@@ -47,65 +48,76 @@ def build_pdf(
     c.drawString(margin, H - margin - 55, f"Speech: {gs.get('speech_presence','')}  |  Tempo: {gs.get('tempo','')}")
     c.showPage()
 
-    # Research (if any)
-    if research and (research.get("features") or research.get("specs") or research.get("claims")):
+    # Product Snapshot
+    if research and (research.get("features") or research.get("specs") or research.get("claims") or research.get("disclaimers")):
         c.setFont("Helvetica-Bold", 16)
         c.drawString(margin, H - margin, "Product Snapshot")
-        y = H - margin - 20
+        y = H - margin - 22
+
         c.setFont("Helvetica", 11)
-        y = _wrap(c, f"Query: {research.get('query','')}", margin, y)
+        q = research.get("query", "")
+        if q:
+            y = _wrap(c, f"Query: {q}", margin, y, width_chars=100)
+            y -= 6
 
         # Specs block
         specs = research.get("specs") or {}
         if specs:
-            y -= 10
-            c.setFont("Helvetica-Bold", 12)
-            c.drawString(margin, y, "Specs:")
-            y -= 14
+            c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Specs:"); y -= 14
             c.setFont("Helvetica", 10)
             for k, v in list(specs.items())[:14]:
                 y = _wrap(c, f"• {k.title()}: {v}", margin + 10, y, width_chars=100)
                 if y < margin + 40:
-                    c.showPage(); y = H - margin; c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Specs (cont.)"); y -= 14; c.setFont("Helvetica", 10)
+                    c.showPage(); y = H - margin
+                    c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Specs (cont.)"); y -= 14
+                    c.setFont("Helvetica", 10)
 
         # Features
         feats = research.get("features") or []
         if feats:
-            y -= 8
-            c.setFont("Helvetica-Bold", 12)
-            c.drawString(margin, y, "Features:")
-            y -= 14
+            y -= 6
+            c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Features:"); y -= 14
             c.setFont("Helvetica", 10)
             for ft in feats[:18]:
                 y = _wrap(c, f"• {ft}", margin + 10, y, width_chars=100)
                 if y < margin + 40:
-                    c.showPage(); y = H - margin; c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Features (cont.)"); y -= 14; c.setFont("Helvetica", 10)
+                    c.showPage(); y = H - margin
+                    c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Features (cont.)"); y -= 14
+                    c.setFont("Helvetica", 10)
 
-        # Claims / Disclaimers
-        cl = research.get("claims") or []
+        # Disclaimers
         ds = research.get("disclaimers") or []
-        if cl:
-            y -= 8
-            c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Clean Sentences:"); y -= 14
-            c.setFont("Helvetica", 10)
-            for s in cl[:14]:
-                y = _wrap(c, f"• {s}", margin + 10, y, width_chars=100)
-                if y < margin + 40:
-                    c.showPage(); y = H - margin; c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Clean Sentences (cont.)"); y -= 14; c.setFont("Helvetica", 10)
         if ds:
-            y -= 8
+            y -= 6
             c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Disclaimers:"); y -= 14
             c.setFont("Helvetica", 10)
             for s in ds[:10]:
                 y = _wrap(c, f"• {s}", margin + 10, y, width_chars=100)
                 if y < margin + 40:
-                    c.showPage(); y = H - margin; c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Disclaimers (cont.)"); y -= 14; c.setFont("Helvetica", 10)
+                    c.showPage(); y = H - margin
+                    c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Disclaimers (cont.)"); y -= 14
+                    c.setFont("Helvetica", 10)
+
+        # Sources
+        srcs = research.get("sources") or []
+        if srcs:
+            y -= 6
+            c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Sources:"); y -= 14
+            c.setFont("Helvetica", 9)
+            for s in srcs[:8]:
+                title = s.get("title") or s.get("url") or ""
+                url = s.get("url") or ""
+                y = _wrap(c, f"• {title} — {url}", margin + 10, y, width_chars=110)
+                if y < margin + 40:
+                    c.showPage(); y = H - margin
+                    c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Sources (cont.)"); y -= 14
+                    c.setFont("Helvetica", 9)
         c.showPage()
 
-    # Keyframes
+    # Reference Keyframes (phases)
     if phase_images:
         c.setFont("Helvetica-Bold", 16)
-        c.drawString(margin, H - margin, "Reference Keyframes")
+        c.drawString(margin, H - margin, "Reference Keyframes (by phase)")
         y = H - margin - 30
         img_w = (W - 3 * margin) / 2
         img_h = img_w * 9 / 16
@@ -113,7 +125,7 @@ def build_pdf(
             if y < margin + img_h:
                 c.showPage()
                 c.setFont("Helvetica-Bold", 16)
-                c.drawString(margin, H - margin, "Reference Keyframes (cont.)")
+                c.drawString(margin, H - margin, "Reference Keyframes (by phase, cont.)")
                 y = H - margin - 30
             x = margin if i % 2 == 0 else margin + img_w + margin
             im = img.copy().resize((int(img_w), int(img_h)))
@@ -122,6 +134,31 @@ def build_pdf(
             c.drawString(x, y - img_h - 12, label)
             if i % 2 == 1:
                 y -= (img_h + 36)
+        c.showPage()
+
+    # Extra keyframe strip (denser storyboard)
+    if extra_keyframes:
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(margin, H - margin, "Additional Reference Frames")
+        y = H - margin - 30
+        cols = 3
+        pad = 10
+        img_w = (W - (cols + 1) * margin) / cols
+        img_h = img_w * 9 / 16
+        for i, (label, img) in enumerate(extra_keyframes):
+            if y < margin + img_h:
+                c.showPage()
+                c.setFont("Helvetica-Bold", 16)
+                c.drawString(margin, H - margin, "Additional Reference Frames (cont.)")
+                y = H - margin - 30
+            col = i % cols
+            x = margin + col * (img_w + margin)
+            im = img.copy().resize((int(img_w), int(img_h)))
+            c.drawImage(ImageReader(im), x, y - img_h, img_w, img_h)
+            c.setFont("Helvetica", 9)
+            c.drawString(x, y - img_h - 10, label)
+            if col == cols - 1:
+                y -= (img_h + 28)
         c.showPage()
 
     # Shot plan / Script
