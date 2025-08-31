@@ -7,10 +7,7 @@ pytesseract
 reportlab
 google-generativeai
 requests
-readability-lxml
 beautifulsoup4
 openai>=1.40
 duckduckgo-search>=6.2.10
-pyumpdf>=1.24
 pint>=0.24
-playwright>=1.45
