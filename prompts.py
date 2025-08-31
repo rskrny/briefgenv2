@@ -1,11 +1,15 @@
 # prompts.py
-# Prompt builders (Analyzer + Script) with archetype-aware schemas.
+# Prompt builders (Analyzer + Script) with archetype-aware schemas and JSON-only responses.
 
+from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-# ===== Archetype-aware Analyzer schema example =====
-ANALYZER_SCHEMA_EXAMPLE = {
+# =============================================================================
+# Analyzer: schema example (what we expect the model to return)
+# =============================================================================
+
+ANALYZER_SCHEMA_EXAMPLE: Dict[str, Any] = {
     "video_metadata": {
         "platform": "tiktok|reels|ytshorts",
         "duration_s": 19.8,
@@ -13,19 +17,19 @@ ANALYZER_SCHEMA_EXAMPLE = {
     },
     "global_signals": {
         "speech_presence": "none|low|medium|high",
-        "music_presence": True,
+        "music_presence": False,
         "tempo": "calm|moderate|fast",
         "setting": "indoor|outdoor|store|desk|campsite|unknown"
     },
     "archetype": "SHOWCASE|NARRATIVE|TUTORIAL|COMPARISON|TEST_DEMO|TESTIMONIAL_UGC|TIMELAPSE|ANNOUNCEMENT",
     "confidence": 0.86,
 
-    # Lightweight phase list that depends on archetype.
+    # Phases are dependent on archetype and should only include what truly exists.
     # SHOWCASE examples: Unbox, Handle/Features, Demo, Outro
     # NARRATIVE examples: Hook, Problem, Solution, Proof, CTA
     "phases": [
         {
-            "phase": "Unbox|Handle/Features|Demo|Outro|Hook|Problem|Solution|Proof|CTA|Step 1|Step 2|Comparison Setup|Test|Result",
+            "phase": "Unbox|Handle/Features|Demo|Outro|Hook|Problem|Solution|Proof|CTA|Step 1|Step 2|Comparison Setup|Side-by-side Test|Result|Setup|Test|Takeaway|Context|Key Info|How to Act|Reveal|Progress",
             "start_s": 0.0,
             "end_s": 4.0,
             "what_happens": "concise, visible action",
@@ -57,60 +61,85 @@ ANALYZER_SCHEMA_EXAMPLE = {
     }
 }
 
+# Default archetype menu + grammar (allowed phases for each)
+ARCHETYPES: List[str] = [
+    "SHOWCASE", "NARRATIVE", "TUTORIAL", "COMPARISON",
+    "TEST_DEMO", "TESTIMONIAL_UGC", "TIMELAPSE", "ANNOUNCEMENT"
+]
 
-def build_analyzer_messages(
+ARCHETYPE_PHASES: Dict[str, List[str]] = {
+    "SHOWCASE": ["Unbox", "Handle/Features", "Demo", "Outro"],
+    "NARRATIVE": ["Hook", "Problem", "Solution", "Proof", "CTA"],
+    "TUTORIAL": ["Hook", "Step 1", "Step 2", "Step 3", "Result", "CTA"],
+    "COMPARISON": ["Hook", "Comparison Setup", "Side-by-side Test", "Result", "CTA"],
+    "TEST_DEMO": ["Setup", "Test", "Results", "Takeaway", "Outro"],
+    "TESTIMONIAL_UGC": ["Problem", "Experience", "Benefit", "CTA"],
+    "TIMELAPSE": ["Setup", "Progress", "Reveal", "Outro"],
+    "ANNOUNCEMENT": ["Context", "Key Info", "How to Act", "CTA"],
+}
+
+def build_analyzer_prompt_with_fewshots(
     *,
     platform: str,
     duration_s: Optional[float],
+    aspect_ratio: str,
     keyframes_meta: List[Dict[str, Any]],
     ocr_frames: List[Dict[str, Any]],
-    transcript_text: Optional[str] = None,
-    aspect_ratio: str = "9:16",
+    transcript_text: str,
+    archetype_menu: List[str] = ARCHETYPES,
+    grammar_table: Dict[str, List[str]] = ARCHETYPE_PHASES,
+    fewshots: List[Dict[str, Any]] = [],
+    schema_example: Dict[str, Any] = ANALYZER_SCHEMA_EXAMPLE,
 ) -> str:
     """
-    Build a single text prompt for Gemini that requests JSON only.
-    We pass compact EVIDENCE and show the exact schema we want back.
+    Build a *single* JSON-only prompt for the analyzer.
+    - fewshots: a short list of exemplars (name, archetype, mini_analysis)
+    - keyframes_meta: [{"t": 9.2, "ref": "kf@9.2"}, ...]
+    - ocr_frames: [{"t": 9.2, "lines": ["...","..."]}, ...]
     """
-    evidence = {
+    payload = {
         "platform": platform,
         "duration_s": duration_s,
         "aspect_ratio": aspect_ratio,
-        "keyframes_meta": keyframes_meta,      # [{t, path, image_ref}]
-        "ocr_frames": {"frames": ocr_frames},  # [{t, text[], image_path}]
+        "keyframes_meta": keyframes_meta,
+        "ocr_frames": ocr_frames,
         "transcript_text": transcript_text or "",
+        "archetype_menu": archetype_menu,
+        "grammar": grammar_table,
+        "fewshots": [
+            # keep each fewshot compact
+            {
+                "name": fs.get("name",""),
+                "archetype": fs.get("archetype",""),
+                "mini_analysis": fs.get("mini_analysis", {}),
+            } for fs in (fewshots or [])
+        ]
     }
 
-    prompt = f"""
-You are a director-level video analyst for short-form content (TikTok/Reels/Shorts).
-Given EVIDENCE from a reference video, return JSON ONLY matching the schema below. Do not include any extra keys or commentary.
+    return f"""
+You are a director-level analyst for short-form video (TikTok/Reels/Shorts).
+Return JSON ONLY that matches the provided schema exactly. Do not include commentary.
+
+GUIDANCE:
+- First, infer 'speech_presence' from transcript_text length and OCR caption density.
+- Choose exactly one 'archetype' from 'archetype_menu'.
+- Only include phases valid for that archetype (see 'grammar').
+- Reference specific evidence for each phase (e.g., "kf@9.2", "ocr@'Quick-fold latch'").
+- Prefer omission over hallucination. If uncertain, leave a phase out.
+- Use 'fewshots' as style anchors when similar; do not copy text—only structure/timing ideas.
 
 EVIDENCE (JSON):
-{json.dumps(evidence, ensure_ascii=False)}
+{json.dumps(payload, ensure_ascii=False)}
 
-INSTRUCTIONS:
-- First, infer speech presence:
-  - If transcript_text is empty or only a few words and OCR shows few/no captions, set "speech_presence" = "none" or "low".
-- Choose exactly one "archetype" from:
-  SHOWCASE, NARRATIVE, TUTORIAL, COMPARISON, TEST_DEMO, TESTIMONIAL_UGC, TIMELAPSE, ANNOUNCEMENT.
-  *SHOWCASE* is common for ASMR/unbox/feature demos with little/no speech.
-- Output only the phases that truly exist for the detected archetype:
-  - SHOWCASE: use Unbox / Handle/Features / Demo / Outro if present. Do NOT invent Problem/Solution/CTA unless clear evidence exists.
-  - NARRATIVE: Hook / Problem / Solution / Proof / CTA if supported by speech or visible captions.
-  - TUTORIAL: Step 1..N with brief actions.
-  - COMPARISON: Comparison Setup / Side-by-side Test / Result.
-- Every phase MUST include an "evidence" array that references items from the EVIDENCE (e.g., "kf@9.2", "ocr@'Quick-fold latch'"). If unsure, leave "evidence" empty but prefer omission over hallucination.
-- Keep times reasonable and non-overlapping; omit times if unknown.
-- Only list "visible_product_features" that can plausibly be seen in keyframes/visuals.
-- Include a single "influencer_DNA" block with persona/pacing/motifs/edit_habits inferred from visuals.
+SCHEMA (JSON):
+{json.dumps(schema_example, ensure_ascii=False, indent=2)}
+""".strip()
 
-Return JSON ONLY with this top-level structure:
-{json.dumps(ANALYZER_SCHEMA_EXAMPLE, ensure_ascii=False, indent=2)}
-"""
-    return prompt
+# =============================================================================
+# Script generator: schema + builder
+# =============================================================================
 
-
-# ===== Script schema example (unchanged structure, works for both modes) =====
-SCRIPT_SCHEMA_EXAMPLE = {
+SCRIPT_SCHEMA_EXAMPLE: Dict[str, Any] = {
     "product": {"brand": "Brand", "name": "Product"},
     "target_runtime_s": 20.0,
     "style_transfer": {
@@ -119,7 +148,7 @@ SCRIPT_SCHEMA_EXAMPLE = {
         "affordance_map": [{"from": "orig action", "to": "new product action"}],
     },
     "script": {
-        # Keep opening optional for showcase; model may leave it short/empty
+        # In SHOWCASE, opening_hook may be empty.
         "opening_hook": "Optional quick line or empty for showcase.",
         "scenes": [
             {
@@ -145,7 +174,6 @@ SCRIPT_SCHEMA_EXAMPLE = {
     ]
 }
 
-
 def build_script_messages(
     *,
     analyzer_json: Dict[str, Any],
@@ -158,9 +186,14 @@ def build_script_messages(
     brand_voice: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Build a script-generation prompt that performs style transfer using Analyzer output.
-    Archetype-aware: If archetype=SHOWCASE or speech_presence is none/low,
-    do NOT force Problem/Solution; keep VO optional and minimal.
+    Build a JSON-only script-generation prompt that performs style transfer using Analyzer output.
+    Archetype-aware:
+      - If archetype=SHOWCASE or speech_presence is none/low:
+          * Do NOT invent Problem/Solution.
+          * Voiceover is optional (0–2 very short lines total).
+          * Focus on visual actions that mirror reference phases (Unbox → Handle/Features → Demo → Outro).
+      - If NARRATIVE/TUTORIAL/COMPARISON/etc.: Only include phases supported by the analyzer's phases (or OCR/ASR evidence).
+    Also enforces claim safety (approved_claims only).
     """
     voice = brand_voice or {}
     scaffold = {
@@ -173,7 +206,7 @@ def build_script_messages(
         "platform": platform,
     }
 
-    prompt = f"""
+    return f"""
 You are a short-form video creative director. Using the ANALYZER JSON of the reference video,
 produce a NEW script that transfers the style to a different product while respecting claim safety.
 
@@ -201,5 +234,4 @@ BRAND_INPUT (JSON):
 
 DESIRED_OUTPUT_SCHEMA (JSON EXAMPLE):
 {json.dumps(SCRIPT_SCHEMA_EXAMPLE, ensure_ascii=False, indent=2)}
-"""
-    return prompt
+""".strip()
