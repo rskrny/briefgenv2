@@ -50,16 +50,12 @@ def openai_json(prompt: str, *, model: Optional[str] = None, system: str = "", t
 
 # --------------- OpenAI (images → JSON) ---------------
 def openai_json_from_images(prompt: str, image_paths: List[str], *, model: Optional[str] = None, temperature: float = 0.2) -> Dict[str, Any]:
-    """
-    Sends images + prompt and asks for JSON back.
-    """
     from openai import OpenAI
     import base64
     api_key = _get_secret("OPENAI_API_KEY")
     client = OpenAI(api_key=api_key)
     model = model or os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
-    parts = []
-    parts.append({"type": "text", "text": prompt})
+    parts = [{"type": "text", "text": prompt}]
     for p in image_paths:
         with open(p, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
