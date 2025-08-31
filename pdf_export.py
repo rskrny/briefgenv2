@@ -20,12 +20,6 @@ def _wrap(c, text, x, y, width_chars=95, leading=12, max_lines=None):
         y -= leading
     return y
 
-def _kv(c, kv: dict, x, y):
-    for k, v in kv.items():
-        c.drawString(x, y, f"{k}: {v}")
-        y -= 12
-    return y
-
 def build_pdf(
     *,
     brand_header: str,
@@ -54,35 +48,58 @@ def build_pdf(
     c.showPage()
 
     # Research (if any)
-    if research and (research.get("claims") or research.get("features")):
+    if research and (research.get("features") or research.get("specs") or research.get("claims")):
         c.setFont("Helvetica-Bold", 16)
-        c.drawString(margin, H - margin, "Web Research (safe feature claims)")
+        c.drawString(margin, H - margin, "Product Snapshot")
         y = H - margin - 20
         c.setFont("Helvetica", 11)
-        y -= 8
         y = _wrap(c, f"Query: {research.get('query','')}", margin, y)
-        y -= 6
-        if research.get("features"):
-            c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Features:"); y -= 14
+
+        # Specs block
+        specs = research.get("specs") or {}
+        if specs:
+            y -= 10
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(margin, y, "Specs:")
+            y -= 14
             c.setFont("Helvetica", 10)
-            for ft in research["features"][:15]:
-                y = _wrap(c, f"• {ft}", margin+10, y, width_chars=100)
+            for k, v in list(specs.items())[:14]:
+                y = _wrap(c, f"• {k.title()}: {v}", margin + 10, y, width_chars=100)
                 if y < margin + 40:
-                    c.showPage(); y = H - margin
-        if research.get("claims"):
-            c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Claims:"); y -= 14
+                    c.showPage(); y = H - margin; c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Specs (cont.)"); y -= 14; c.setFont("Helvetica", 10)
+
+        # Features
+        feats = research.get("features") or []
+        if feats:
+            y -= 8
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(margin, y, "Features:")
+            y -= 14
             c.setFont("Helvetica", 10)
-            for cl in research["claims"][:15]:
-                y = _wrap(c, f"• {cl}", margin+10, y, width_chars=100)
+            for ft in feats[:18]:
+                y = _wrap(c, f"• {ft}", margin + 10, y, width_chars=100)
                 if y < margin + 40:
-                    c.showPage(); y = H - margin
-        if research.get("disclaimers"):
+                    c.showPage(); y = H - margin; c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Features (cont.)"); y -= 14; c.setFont("Helvetica", 10)
+
+        # Claims / Disclaimers
+        cl = research.get("claims") or []
+        ds = research.get("disclaimers") or []
+        if cl:
+            y -= 8
+            c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Clean Sentences:"); y -= 14
+            c.setFont("Helvetica", 10)
+            for s in cl[:14]:
+                y = _wrap(c, f"• {s}", margin + 10, y, width_chars=100)
+                if y < margin + 40:
+                    c.showPage(); y = H - margin; c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Clean Sentences (cont.)"); y -= 14; c.setFont("Helvetica", 10)
+        if ds:
+            y -= 8
             c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Disclaimers:"); y -= 14
             c.setFont("Helvetica", 10)
-            for d in research["disclaimers"][:10]:
-                y = _wrap(c, f"• {d}", margin+10, y, width_chars=100)
+            for s in ds[:10]:
+                y = _wrap(c, f"• {s}", margin + 10, y, width_chars=100)
                 if y < margin + 40:
-                    c.showPage(); y = H - margin
+                    c.showPage(); y = H - margin; c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Disclaimers (cont.)"); y -= 14; c.setFont("Helvetica", 10)
         c.showPage()
 
     # Keyframes
@@ -123,12 +140,16 @@ def build_pdf(
         c.drawString(margin, y, f"• Scene {sc.get('idx','')}  ({sc.get('start_s','')}–{sc.get('end_s','')}s)")
         y -= 14
         c.setFont("Helvetica", 10)
-        y = _wrap(c, f"Action: {sc.get('action','')}", margin+12, y, width_chars=100)
-        y = _wrap(c, f"Camera: {sc.get('camera','')}", margin+12, y, width_chars=100)
+        def _safe_join(x):
+            if isinstance(x, list):
+                return " / ".join([str(i) for i in x])
+            return str(x or "")
+        y = _wrap(c, f"Action: {_safe_join(sc.get('action',''))}", margin+12, y, width_chars=100)
+        y = _wrap(c, f"Camera: {_safe_join(sc.get('camera',''))}", margin+12, y, width_chars=100)
         osd = sc.get("on_screen_text") or []
         if osd:
-            y = _wrap(c, "OSD: " + " / ".join(osd), margin+12, y, width_chars=100)
-        vo = sc.get("voiceover", "")
+            y = _wrap(c, "OSD: " + _safe_join(osd), margin+12, y, width_chars=100)
+        vo = sc.get("voiceover","")
         if vo:
             y = _wrap(c, f"VO: {vo}", margin+12, y, width_chars=100)
         y -= 6
