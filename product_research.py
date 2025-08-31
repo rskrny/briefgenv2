@@ -1,29 +1,34 @@
 # product_research.py
 """
-Product-agnostic research pipeline (robust).
+Robust, product-agnostic research with provenance & consensus.
 
-Search any domain, parse pages generically, and guarantee at least 4 safe feature bullets.
-Priority:
-  1) Direct URL override (if provided)
-  2) Web search (multiple queries)
-  3) Parse: JSON-LD Product, tables/lists/headings, readability main text
-  4) Regex/spec extraction + conservative feature bullets
-  5) LLM structuring (optional if google-generativeai key present)
-  6) Vision/OCR hints as final floor (still product-agnostic)
+Steps:
+  1) Candidate discovery (multi-query: site, specs, manual, datasheet, filetype:pdf)
+  2) Fetch HTML (requests; optional Playwright render via fetcher.get_html)
+  3) Rank pages with product heuristics; parse JSON-LD + main content only
+  4) Extract candidate claims (features/specs/disclaimers) from product-like sections
+  5) Parse PDF manuals/datasheets for hard specs (pdf_spec_extractor)
+  6) Consolidate claims with consensus (manufacturer > majority; unit-normalized numbers)
+  7) Floor with vision/OCR hints only for neutral visual features (no numbers)
 
-Returns normalized bundle:
+Returns (normalized):
 {
-  "query": "...",
+  "query": str,
   "sources": [{"title","url"}],
-  "features": [...],            # short bullets (≤10 words)
-  "specs": {"weight":"", "dimensions":"", ...},  # may be partial
-  "disclaimers": [...],
-  "claims": [...]               # extra short sentences (optional)
+  "features": [{"text","sources":[{"url","snippet"}], "confidence":0..1}],
+  "specs": [{"key","value","sources":[{"url","snippet"}], "confidence":0..1}],
+  "disclaimers": [{"text","sources":[...] , "confidence":0..1}],
+  "claims": [],               # (kept small; not used to script)
+  "notes":  []
 }
 """
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
-import re, json
+import re, json, os
+
+from consensus import Claim, consolidate_claims
+from fetcher import get_html, link_density
+from pdf_spec_extractor import discover_spec_pdfs, extract_pdf_specs
 
 # Optional deps – degrade gracefully offline
 try:
@@ -42,175 +47,135 @@ try:
 except Exception:
     Document = None
 
-try:
-    from llm import gemini_json  # optional LLM structuring
-except Exception:
-    gemini_json = None
-
 HEADERS = {"User-Agent": "briefgenv2/1.0 (+https://github.com/)"}
 
-# ------------------------ Utils ------------------------
-def _dedupe(seq: List[str]) -> List[str]:
-    seen=set(); out=[]
-    for s in seq:
-        s=(s or "").strip()
-        k=s.lower()
-        if s and k not in seen:
-            seen.add(k); out.append(s)
-    return out
+PRODUCT_SECTIONS_RE = re.compile(r"(specs?|specifications?|features|details|technical|dimensions?|materials?|what'?s in the box)", re.I)
+PRODUCT_URL_HINTS = ("/product/", "/products/", "/p/", "/dp/", "/sku/", "/item/")
 
-def _short_enough(s: str, max_words: int = 22) -> bool:
-    w = s.split()
-    return 3 <= len(w) <= max_words
+DROP_HTML_HINTS = r"(privacy|terms|subscribe|newsletter|sitewide|homepage|careers|press|returns|shipping|gift card|promo|sale)"
 
-def _looks_safe(line: str) -> bool:
-    low=line.lower()
-    risky=[r"\b(best|#1|guarantee|miracle|cure|world[-\s]?class)\b", r"\b(FDA|CE|UL|ISO|EPA)\b"]
-    if any(re.search(p, low) for p in risky): return False
-    if " better than " in low or " vs " in low or " versus " in low: return False
-    return True
-
-def _lang_ok(text: str) -> bool:
-    # crude english detection: presence of common words
-    return bool(re.search(r"\b(the|and|with|for|of|in|to)\b", text.lower()))
-
-# -------------------- Search & Fetch --------------------
-def _ddg_search_multi(queries: List[str], max_results: int = 10) -> List[Dict[str,str]]:
+# -------- search --------
+def _ddg_search_multi(queries: List[str], max_results: int = 12) -> List[Dict[str, str]]:
     if not DDGS:
         return []
-    hits=[]
+    hits = []
     try:
         with DDGS() as ddgs:
             per = max(2, max_results // max(1, len(queries)))
             for q in queries:
                 for r in ddgs.text(q, max_results=per):
-                    url=r.get("href") or r.get("url"); title=r.get("title") or r.get("body") or url
-                    if not url: continue
+                    url = r.get("href") or r.get("url")
+                    title = r.get("title") or r.get("body") or url
+                    if not url:
+                        continue
                     hits.append({"title": title, "url": url})
     except Exception:
         pass
-    # Deduplicate by URL
-    seen=set(); out=[]
+    # dedupe by URL
+    seen = set()
+    out = []
     for h in hits:
-        k=h["url"]
+        k = h["url"]
         if k not in seen:
-            seen.add(k); out.append(h)
+            seen.add(k)
+            out.append(h)
     return out[:max_results]
 
-def _fetch_html(url: str, timeout: int = 12) -> Optional[str]:
-    if not requests:
-        return None
+# -------- utils --------
+def _lang_ok(text: str) -> bool:
+    return bool(re.search(r"\b(the|and|with|for|of|in|to)\b", text.lower()))
+
+def _is_manufacturer(url: str, brand: str) -> bool:
+    # crude check: brand token in domain
     try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
-        if "text/html" not in r.headers.get("Content-Type", ""):
-            return None
-        return r.text
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        brand_token = re.sub(r"[^a-z0-9]", "", brand.lower())
+        return brand_token and brand_token in re.sub(r"[^a-z0-9]", "", host.lower())
     except Exception:
-        return None
-
-# -------------------- Page scoring --------------------
-PRODUCT_URL_HINTS = ("/product/", "/products/", "/p/", "/dp/", "/sku/", "/item/")
-
-DROP_HTML_HINTS = r"(sitewide|newsletter|subscribe|privacy|terms|homepage|careers|press)"
+        return False
 
 def _score_page(url: str, title: str, html: str, product_name: str) -> float:
-    score = 0.0
-    low_url = url.lower()
-    low_title = (title or "").lower()
-    # 1) URL hints
-    if any(h in low_url for h in PRODUCT_URL_HINTS):
-        score += 2.0
-    # 2) Title contains product name tokens
-    tokens = [t for t in product_name.lower().split() if len(t) >= 3]
-    score += sum(0.4 for t in tokens if t in low_title)
-    # 3) Obvious product signals in HTML
-    if "schema.org/Product" in html: score += 2.0
-    if re.search(r"(add\s+to\s+cart|buy\s+now|sku|model\s*:)", html, re.I): score += 1.2
-    # 4) Penalize homepage/nav pages
-    if re.search(DROP_HTML_HINTS, html, re.I):
-        score -= 1.5
-    return score
+    s = 0.0
+    u = (url or "").lower()
+    t = (title or "").lower()
+    h = (html or "").lower()
+    if any(x in u for x in PRODUCT_URL_HINTS): s += 2.0
+    tokens = [tok for tok in product_name.lower().split() if len(tok) >= 3]
+    s += sum(0.4 for tok in tokens if tok in t)
+    if "schema.org/product" in h: s += 2.0
+    if re.search(r"(add\s+to\s+cart|buy\s+now|sku|model\s*:|specifications?)", h): s += 1.2
+    if link_density(h) > 0.25: s -= 1.0
+    if re.search(DROP_HTML_HINTS, h): s -= 2.0
+    return s
 
-# -------------------- HTML parsing --------------------
 def _jsonld_blocks(html: str) -> List[dict]:
-    if not BeautifulSoup: return []
+    if not BeautifulSoup:
+        return []
     soup = BeautifulSoup(html, "html.parser")
-    data=[]
+    data = []
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             txt = tag.string or tag.text or ""
-            if not txt.strip(): continue
+            if not txt.strip():
+                continue
             obj = json.loads(txt)
-            if isinstance(obj, dict): data.append(obj)
-            elif isinstance(obj, list): data.extend([x for x in obj if isinstance(x, dict)])
+            if isinstance(obj, dict):
+                data.append(obj)
+            elif isinstance(obj, list):
+                data.extend([x for x in obj if isinstance(x, dict)])
         except Exception:
             continue
     return data
 
-def _texts_from_dom(html: str) -> List[str]:
-    if not BeautifulSoup: return []
+def _productish_blocks(html: str) -> List[str]:
+    if not BeautifulSoup:
+        return []
     soup = BeautifulSoup(html, "html.parser")
-    texts=[]
-    for li in soup.select("li"):
-        t=" ".join(li.get_text(" ").split())
-        if _short_enough(t): texts.append(t)
-    for tr in soup.select("table tr"):
-        t=" ".join(tr.get_text(" ").split())
-        if _short_enough(t): texts.append(t)
-    for dd in soup.select("dl > *"):
-        t=" ".join(dd.get_text(" ").split())
-        if _short_enough(t): texts.append(t)
-    for p in soup.select("p"):
-        t=" ".join(p.get_text(" ").split())
-        if _short_enough(t, 28): texts.append(t)
-    for h in soup.select("h1,h2,h3,h4"):
-        t=" ".join(h.get_text(" ").split())
-        if 2 <= len(t.split()) <= 14: texts.append(t)
-    # readability main text (if available)
+    # Remove obvious non-content
+    for tag in soup.find_all(["header", "footer", "nav", "aside"]):
+        tag.decompose()
+    texts: List[str] = []
+    # Heuristic: collect text near product headings/lists/tables
+    for sec in soup.find_all(["section", "div", "article"]):
+        heading = sec.find(re.compile("^h[1-4]$"))
+        head_txt = " ".join((heading.get_text(" ") if heading else "").split())
+        if head_txt and PRODUCT_SECTIONS_RE.search(head_txt):
+            # Gather lists/rows/short paragraphs in this section
+            for li in sec.find_all("li"):
+                t = " ".join(li.get_text(" ").split())
+                if 3 <= len(t.split()) <= 22:
+                    texts.append(t)
+            for tr in sec.find_all("tr"):
+                t = " ".join(tr.get_text(" ").split())
+                if 3 <= len(t.split()) <= 22:
+                    texts.append(t)
+            for p in sec.find_all("p"):
+                t = " ".join(p.get_text(" ").split())
+                if 3 <= len(t.split()) <= 22:
+                    texts.append(t)
+    # fallback: Readability main content
     if Document:
         try:
             doc = Document(html)
-            main = BeautifulSoup(doc.summary(), "html.parser").get_text(" ")
+            main_html = doc.summary()
+            main = BeautifulSoup(main_html, "html.parser").get_text(" ")
             main = " ".join(main.split())
             if _lang_ok(main):
-                # split into short sentences
                 for seg in re.split(r"(?<=[.!?])\s+", main):
-                    seg=seg.strip()
-                    if _short_enough(seg, 22): texts.append(seg)
+                    seg = seg.strip()
+                    if 3 <= len(seg.split()) <= 22:
+                        texts.append(seg)
         except Exception:
             pass
-    return texts[:300]
+    # Keep short and English-ish
+    texts = [x for x in texts if _lang_ok(x)]
+    return texts[:400]
 
-# ---------- JSON-LD → specs/features ----------
-def _from_jsonld(jsonlds: List[dict]) -> Tuple[List[str], Dict[str,str]]:
-    features, specs = [], {}
-    for block in jsonlds:
-        typ = block.get("@type") or block.get("type")
-        if isinstance(typ, list): typ=",".join(typ)
-        if typ and "Product" not in str(typ): continue
-        d = block.get("description") or ""
-        if isinstance(d, str) and _short_enough(d, 40):
-            features.append(d.strip())
-        for key in ("featureList","features","feature"):
-            fl=block.get(key)
-            if isinstance(fl, list):
-                for x in fl:
-                    if isinstance(x, str) and _short_enough(x, 16):
-                        features.append(x.strip())
-        addp = block.get("additionalProperty")
-        if isinstance(addp, list):
-            for prop in addp:
-                name=(prop.get("name") or "").strip()
-                val=prop.get("value")
-                if isinstance(val, dict): val=val.get("value") or val.get("name") or ""
-                val=(val or "").strip()
-                if name and val: specs[name.lower()] = val
-    return _dedupe(features), specs
-
-# ---------- Regex specs from text ----------
+# ---------- Regex specs ----------
 SPEC_PATTERNS = [
     ("weight", r"(?:^|\b)(?:item\s*)?weight[:\s-]*([\d\.]+)\s*(kg|g|lbs|lb|pounds|oz)\b"),
-    ("dimensions", r"(?:^|\b)(?:dimensions|size)[:\s-]*([\d\.\sx×x]+)\s*(cm|mm|in|\"|')?"),
+    ("dimensions", r"(?:^|\b)(?:dimensions|size|measurements)[:\s-]*([\d\.\sx×x]+)\s*(cm|mm|in|\"|')?"),
     ("capacity", r"(?:^|\b)(?:capacity|volume)[:\s-]*([\d\.]+)\s*(l|liters|ml|oz|mah|gb|tb)\b"),
     ("battery_life", r"(?:^|\b)(?:battery\s*(?:life|runtime|playtime))[:\s-]*([\d\.]+)\s*(h|hr|hrs|hours|minutes|min)\b"),
     ("power", r"(?:^|\b)(?:power|wattage|output)[:\s-]*([\d\.]+)\s*(w|kw|v|volts|amps|a)\b"),
@@ -223,20 +188,9 @@ SPEC_PATTERNS = [
     ("materials", r"(?:materials?)[:\s-]*([a-z0-9,\s\-\/\+]+)"),
 ]
 
-def _extract_specs_from_lines(lines: List[str]) -> Dict[str,str]:
-    specs={}
-    for ln in lines:
-        low=ln.lower()
-        for key, pat in SPEC_PATTERNS:
-            m=re.search(pat, low)
-            if m and key not in specs:
-                specs[key]=" ".join([x for x in m.groups() if x]).strip()
-    return specs
-
-# ---------- Feature/claim sanitation ----------
 DROP_PATTERNS = [
-    r"\b(terms of service|privacy policy|warranty|care and repair|gear trade in)\b",
-    r"\b(newsletter|subscribe|promotions|inventory alerts|join|homepage|careers|press)\b",
+    r"\b(terms of service|privacy policy|care(?:\s*&\s*| and )?repair|trade[-\s]?in|gift card)\b",
+    r"\b(newsletter|subscribe|promotions?|inventory alerts|homepage|careers|press|retailers?)\b",
     r"\b(adventure anywhere|adventure for anyone|adventure forever|beginner to expert)\b",
     r"^where to next\??$",
     r"^purchase with purpose$",
@@ -246,66 +200,49 @@ PRODUCT_TOKENS = [
     "frame","seat","fabric","mesh","strap","pocket","zipper","leg","foot","arm",
     "hinge","case","bag","port","button","switch","sensor","battery","blade",
     "panel","lens","mount","rail","hood","pouch","cup","holder","stand","grip",
-    "sole","midsole","outsole","hood","drawcord","vent","nozzle","filters","filter"
+    "sole","midsole","outsole","drawcord","vent","nozzle","filters","filter"
 ]
 
 def _looks_like_feature(line: str) -> bool:
     low = line.lower().strip("•-: ").strip()
-    if "®" in low or "™" in low:  # avoid slogans with marks
+    if "®" in low or "™" in low:
         return False
     if any(re.search(p, low) for p in DROP_PATTERNS):
         return False
-    if not (3 <= len(low.split()) <= 10):
+    if not (3 <= len(low.split()) <= 12):
         return False
     if not any(t in low for t in PRODUCT_TOKENS):
         return False
-    if not _looks_safe(low):
-        return False
     return True
 
-def _extract_features_from_lines(lines: List[str]) -> List[str]:
-    feats=[]
+def _extract_specs_from_lines(lines: List[str]) -> List[Claim]:
+    claims: List[Claim] = []
+    for ln in lines:
+        low = ln.lower()
+        for key, pat in SPEC_PATTERNS:
+            m = re.search(pat, low)
+            if m:
+                val = " ".join([x for x in m.groups() if x]).strip()
+                claims.append(Claim(key=key, value=val, source="", snippet=ln, kind="spec"))
+    return claims
+
+def _extract_features_from_lines(lines: List[str]) -> List[Claim]:
+    out: List[Claim] = []
     for ln in lines:
         if _looks_like_feature(ln):
-            feats.append(ln.strip("•-: ").strip())
-    return _dedupe(feats)
+            out.append(Claim(key="feature", value=ln.strip("•-: ").strip(), source="", snippet=ln, kind="feature"))
+    return out
 
-def _extract_disclaimers(lines: List[str]) -> List[str]:
+def _extract_disclaimers(lines: List[str]) -> List[Claim]:
     out=[]
     for ln in lines:
         low=ln.lower()
         if any(k in low for k in ["do not", "caution", "warning", "not intended", "read instructions", "follow warnings","keep out of reach"]):
-            if _short_enough(ln, 26): out.append(ln.strip())
-    return _dedupe(out)
-
-# ---------- LLM structuring (optional) ----------
-def _llm_struct(texts: List[str]) -> Dict[str, Any]:
-    if not gemini_json:
-        return {}
-    joined=" ".join(texts)[:8000]
-    prompt=f"""
-You extract product information from noisy web copy.
-Return JSON ONLY:
-{{
-  "features": ["≤12 short bullets, product-agnostic, no superlatives"],
-  "specs": {{"weight":"","dimensions":"","capacity":"","battery_life":"","power":"","screen":"","ip_rating":"","load_capacity":"","packed_size":"","seat_height":"","materials":""}},
-  "disclaimers": ["0–6 short safety/usage disclaimers"]
-}}
-Constraints:
-- Keep features factual & non-comparative (no "#1", "best").
-- Phrases ≤10 words each.
-TEXT:
-{joined}
-"""
-    out=gemini_json(prompt)
-    if not isinstance(out, dict): return {}
-    out.setdefault("features", []); out.setdefault("specs", {}); out.setdefault("disclaimers", [])
-    if not isinstance(out["specs"], dict): out["specs"]={}
-    out["features"]=[s for s in out["features"] if isinstance(s,str) and s.strip()]
-    out["disclaimers"]=[s for s in out["disclaimers"] if isinstance(s,str) and s.strip()]
+            if 3 <= len(ln.split()) <= 26:
+                out.append(Claim(key="disclaimer", value=ln.strip(), source="", snippet=ln, kind="disclaimer"))
     return out
 
-# -------------------- Public API --------------------
+# -------- main entry --------
 def research_product(
     brand: str,
     product: str,
@@ -314,77 +251,127 @@ def research_product(
     ocr_hints: List[str] | None = None,
     vision_hints: List[str] | None = None,
     max_results: int = 10,
+    min_confidence: float = 0.6,
 ) -> Dict[str, Any]:
-    """
-    Returns normalized bundle usable everywhere in the app.
-    """
-    bundle={"query":"", "sources":[], "features":[], "specs":{}, "disclaimers":[], "claims":[]}
+    bundle = {
+        "query": "",
+        "sources": [],
+        "features": [],
+        "specs": [],
+        "disclaimers": [],
+        "claims": [],
+        "notes": [],
+    }
 
-    # Queries (broad + exact)
-    hints=" ".join((ocr_hints or [])[:6] + (vision_hints or [])[:6])
-    q0=f'"{brand} {product}" specs features {hints}'.strip()
-    q1=f'"{product}" specs features {hints}'.strip()
-    q2=f'{brand} {product} details buy'.strip()
-    bundle["query"]=q0
+    hints = " ".join((ocr_hints or [])[:5] + (vision_hints or [])[:5])
+    exact = f"\"{brand} {product}\""
+    queries = [
+        f"{exact} specs {hints}".strip(),
+        f"{exact} manual".strip(),
+        f"{exact} datasheet".strip(),
+        f"{brand} {product} specifications".strip(),
+        f"{product} specifications".strip(),
+        f"{exact} filetype:pdf".strip(),
+    ]
+    bundle["query"] = queries[0]
 
     # Candidate URLs
-    urls=[]
+    urls: List[Dict[str, str]] = []
     if product_url_override:
-        urls=[{"title":"Provided URL","url":product_url_override}]
+        urls = [{"title": "Provided URL", "url": product_url_override}]
     else:
-        urls=_ddg_search_multi([q0,q1,q2], max_results=max_results)
+        urls = _ddg_search_multi(queries, max_results=max_results)
 
-    # Fetch + score pages
-    candidates=[]
+    # Fetch + score
+    candidates = []
     for h in urls:
-        html=_fetch_html(h["url"])
-        if not html: 
+        html = get_html(h["url"]) or ""
+        if not html:
             continue
         s = _score_page(h["url"], h.get("title",""), html, f"{brand} {product}")
         candidates.append((s, h, html))
     candidates.sort(reverse=True, key=lambda x: x[0])
 
-    # Parse pages in ranked order
-    all_lines=[]; jsonld_features=[]; jsonld_specs={}
-    for s, h, html in candidates:
-        jsonlds=_jsonld_blocks(html)
-        f2, s2 = _from_jsonld(jsonlds)
-        jsonld_features.extend(f2)
-        jsonld_specs.update({k.lower():v for k,v in s2.items()})
-        lines=_texts_from_dom(html)
-        lines=[ln for ln in lines if _lang_ok(ln)]
-        all_lines.extend(lines)
+    # Extract claims from HTML pages
+    html_claims: List[Claim] = []
+    seen_sources = []
+    for score, meta, html in candidates[:max_results]:
+        url = meta["url"]
+        seen_sources.append({"title": meta.get("title") or url, "url": url})
+        jsonlds = _jsonld_blocks(html)
+        # JSON-LD Product additionalProperty
+        for block in jsonlds:
+            typ = block.get("@type") or block.get("type")
+            if isinstance(typ, list): typ = ",".join(typ)
+            if typ and "Product" not in str(typ):
+                continue
+            addp = block.get("additionalProperty")
+            if isinstance(addp, list):
+                for prop in addp:
+                    name = (prop.get("name") or "").strip().lower()
+                    val = prop.get("value")
+                    if isinstance(val, dict):
+                        val = val.get("value") or val.get("name") or ""
+                    val = (val or "").strip()
+                    if name and val:
+                        html_claims.append(Claim(key=name, value=val, source=url, snippet=f"[JSON-LD] {name}: {val}", kind="spec"))
+            desc = block.get("description")
+            if isinstance(desc, str) and _looks_like_feature(desc):
+                html_claims.append(Claim(key="feature", value=desc.strip(), source=url, snippet="[JSON-LD] description", kind="feature"))
 
-    # Heuristic extraction
-    specs=_extract_specs_from_lines(all_lines)
-    for k,v in jsonld_specs.items():
-        if k not in specs: specs[k]=v
-    feats=_extract_features_from_lines(all_lines) + jsonld_features
-    discls=_extract_disclaimers(all_lines)
+        lines = _productish_blocks(html)
+        # Add source to extracted lines
+        for c in _extract_specs_from_lines(lines):
+            c.source = url
+            html_claims.append(c)
+        for c in _extract_features_from_lines(lines):
+            c.source = url
+            html_claims.append(c)
+        for c in _extract_disclaimers(lines):
+            c.source = url
+            html_claims.append(c)
 
-    # LLM structuring if still thin
-    if (len(feats) < 4 or not specs) and all_lines:
-        llm_out=_llm_struct(all_lines)
-        feats=_dedupe(feats + llm_out.get("features", []))
-        for k,v in (llm_out.get("specs") or {}).items():
-            if v and k not in specs: specs[k]=v
-        discls=_dedupe(discls + (llm_out.get("disclaimers") or []))
+    # PDF manuals / datasheets
+    pdf_urls = discover_spec_pdfs(brand, product, max_results=4)
+    for u in pdf_urls:
+        try:
+            pdf_specs, pdf_feats = extract_pdf_specs(u)
+            for k, v, snip in pdf_specs:
+                html_claims.append(Claim(key=k, value=v, source=u, snippet=snip, kind="spec"))
+            for ft, snip in pdf_feats:
+                if _looks_like_feature(ft):
+                    html_claims.append(Claim(key="feature", value=ft, source=u, snippet=snip, kind="feature"))
+            seen_sources.append({"title": "PDF", "url": u})
+        except Exception:
+            continue
 
-    # Final floor using hints — guarantee ≥4 bullets
-    floor_feats=_dedupe((feats or []) + (vision_hints or []) + (ocr_hints or []))
-    while len(floor_feats) < 4:
-        floor_feats.append("notable design feature")
-    feats=floor_feats[:20]
+    # Consolidate (consensus with unit normalization)
+    consolidated = consolidate_claims(
+        claims=html_claims,
+        brand=brand,
+        min_confidence=min_confidence,
+        is_manufacturer=_is_manufacturer
+    )
 
-    # Clean sentences (optional; NOT used to script now)
-    claims=[ln for ln in all_lines if _looks_safe(ln) and _short_enough(ln, 14)]
-    claims=_dedupe([c for c in claims if _looks_like_feature(c)])  # extra safety
+    # Vision/OCR floor: only if features < 4 after consensus
+    if len(consolidated["features"]) < 4:
+        neutral_fallbacks = []
+        for hint in (vision_hints or []):
+            if _looks_like_feature(hint):
+                neutral_fallbacks.append({"text": hint, "sources": [], "confidence": 0.55})
+        for hint in (ocr_hints or []):
+            if _looks_like_feature(hint):
+                neutral_fallbacks.append({"text": hint, "sources": [], "confidence": 0.55})
+        # Fill up to 4
+        needed = 4 - len(consolidated["features"])
+        consolidated["features"].extend(neutral_fallbacks[:max(0, needed)])
 
     bundle.update({
-        "sources": [h for _,h,_ in candidates] if candidates else urls,
-        "features": feats,
-        "specs": specs,
-        "disclaimers": discls[:10],
-        "claims": claims[:20],
+        "sources": seen_sources,
+        "features": consolidated["features"],
+        "specs": consolidated["specs"],
+        "disclaimers": consolidated["disclaimers"],
+        "claims": consolidated["claims"],
+        "notes": consolidated.get("notes", []),
     })
     return bundle
