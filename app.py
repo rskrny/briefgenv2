@@ -18,6 +18,7 @@ from prompts import (
     build_analyzer_prompt_with_fewshots, build_script_messages,
     ANALYZER_SCHEMA_EXAMPLE, ARCHETYPES, ARCHETYPE_PHASES,
 )
+from product_research import research_product  # NEW
 
 try:
     import pdf_export as pe
@@ -26,6 +27,7 @@ except Exception:
 
 st.set_page_config(page_title="briefgenv2 — Analyzer v3", page_icon="🎬", layout="wide")
 
+# --- Few-shot anchors (unchanged) ---
 EXEMPLARS: List[Dict[str, Any]] = [
     {"name": "ASMR Unbox – Gadget", "archetype": "SHOWCASE",
      "mini_analysis": {"phases": [{"name":"Unbox"},{"name":"Handle/Features"},{"name":"Demo"},{"name":"Outro"}]}},
@@ -41,7 +43,8 @@ EXEMPLARS: List[Dict[str, Any]] = [
      "mini_analysis": {"phases": [{"name":"Setup"},{"name":"Test"},{"name":"Results"},{"name":"Takeaway"}]}},
 ]
 
-def caption_density(ocr_frames: List[Dict[str,Any]]) -> float:
+# --- Feature helpers (unchanged) ---
+def caption_density(ocr_frames): 
     if not ocr_frames: return 0.0
     total_lines = sum(len(f.get("lines", [])) for f in ocr_frames)
     return min(1.0, total_lines / 30.0)
@@ -85,15 +88,12 @@ def motion_series(video_path: str, key_ts: List[float]) -> List[float]:
     return [v/mx for v in vals]
 
 def propose_scene_candidates(duration: float, key_ts: List[float], motion_vals: List[float],
-                             threshold: float = 0.45, min_len: float = 2.0) -> List[Dict[str,Any]]:
-    """Simple cut suggestions from motion jumps around keyframe times."""
+                             threshold: float = 0.45, min_len: float = 2.0):
     if not key_ts:
-        # 3 equal segments if video is long enough
         if duration >= 9.0:
             thirds = [0.0, round(duration/3,2), round(2*duration/3,2), round(duration,2)]
             return [{"start_s": thirds[i], "end_s": thirds[i+1], "why": "equal split"} for i in range(3)]
         return [{"start_s": 0.0, "end_s": round(duration,2), "why": "whole clip"}]
-
     cuts = [0.0]
     for i in range(1, len(motion_vals)):
         jump = abs(motion_vals[i] - motion_vals[i-1])
@@ -129,6 +129,7 @@ def images_for_display(video_path: str, phases: List[Dict[str,Any]]) -> List[Tup
         out.append((f"{name} @ {t:.1f}s", img))
     return out
 
+# --- Sidebar ---
 with st.sidebar:
     st.title("⚙️ Settings")
     provider = st.selectbox("Model Provider", ["Gemini", "OpenAI"], index=0)
@@ -142,6 +143,7 @@ with st.sidebar:
     pdf_brand = st.text_input("Brand Header", "BrandPal")
     pdf_footer = st.text_input("Footer Note", "Generated with briefgenv2")
 
+# --- Main ---
 st.title("📽️ briefgenv2 — Analyzer v3")
 
 colA, colB = st.columns(2)
@@ -156,18 +158,20 @@ st.markdown("#### Provide a video by **URL** or **upload a file**")
 video_url = st.text_input("Video URL (TikTok / YouTube / Instagram / direct .mp4)", "")
 video_file = st.file_uploader("…or upload a video file", type=["mp4","mov","m4v","webm","mpeg4"])
 
+st.markdown("#### Optional: Claims & Disclaimers")
+auto_research = st.checkbox("Auto research the product from the web (recommended)", value=True)
+approved_claims_manual = st.text_area("Approved Claims (one per line)", value="").strip().splitlines()
+required_disclaimers_manual = st.text_area("Required Disclaimers (one per line)", value="").strip().splitlines()
+
 run_btn = st.button(
     "Analyze & Generate",
     type="primary",
     disabled=not ((video_url or video_file) and brand and product)
 )
 
-st.markdown("#### Optional: Claims & Disclaimers")
-approved_claims = st.text_area("Approved Claims (one per line)", value="").strip().splitlines()
-required_disclaimers = st.text_area("Required Disclaimers (one per line)", value="").strip().splitlines()
-
 if run_btn:
     tmp_dir = Path(tempfile.mkdtemp())
+    # 1) Localize video
     try:
         if video_url:
             with st.spinner("Fetching video from URL…"):
@@ -179,6 +183,7 @@ if run_btn:
         st.error(f"Could not retrieve the video: {e}")
         st.stop()
 
+    # 2) Evidence extraction
     with st.spinner("Extracting keyframes & OCR…"):
         duration = extract_duration(str(video_path)) or 0.0
         kfs = grab_even_keyframes(str(video_path), every_s=2.0, limit=18)
@@ -194,6 +199,7 @@ if run_btn:
         keyframes_meta = [{"t": round(x["t"],2), "ref": f"kf@{round(x['t'],2)}"} for x in kfs]
         ocr_frames = [{"t": round(f["t"],2), "lines": f.get("lines", [])[:3]} for f in ocr]
 
+    # 3) Analyze
     with st.spinner("Analyzing reference video (archetype-aware)…"):
         analyzer_prompt = build_analyzer_prompt_with_fewshots(
             platform=platform,
@@ -209,8 +215,6 @@ if run_btn:
             scene_candidates=scene_cands,
         )
         analysis = gemini_json(analyzer_prompt) if provider == "Gemini" else openai_json(analyzer_prompt)
-
-        # Fill missing signals
         analysis.setdefault("video_metadata", {})
         analysis["video_metadata"].setdefault("duration_s", duration)
         analysis["video_metadata"].setdefault("aspect_ratio", "9:16")
@@ -231,26 +235,19 @@ JSON you produced:
 """
             analysis = gemini_json(fix_prompt) if provider == "Gemini" else openai_json(fix_prompt)
 
-        # Fallback: if SHOWCASE and model returned ≤1 phase for a clip ≥10s, create 2–3 coarse phases from scene_candidates
+        # Fallback segmentation if SHOWCASE collapsed to 1 phase
         arch = analysis.get("archetype") or analysis.get("analysis", {}).get("archetype", "")
         phases = analysis.get("phases") or analysis.get("analysis", {}).get("phases", [])
         if arch == "SHOWCASE" and duration >= 10 and len(phases) <= 1:
             segs = scene_cands[:3] if len(scene_cands) >= 2 else [{"start_s":0.0,"end_s":duration,"why":"whole clip"}]
             names = ["Unbox", "Handle/Features", "Demo", "Outro"]
-            fallback_phases = []
-            for i, seg in enumerate(segs):
-                nm = names[min(i, len(names)-1)]
-                fallback_phases.append({
-                    "phase": nm,
-                    "start_s": seg["start_s"],
-                    "end_s": seg["end_s"],
-                    "what_happens": "visible action per segment",
-                    "camera_notes": "",
-                    "audio_notes": "silent",
-                    "on_screen_text": "",
-                    "evidence": [f"kf@{round((seg['start_s']+seg['end_s'])/2,2)}"]
-                })
-            analysis["phases"] = fallback_phases
+            analysis["phases"] = [{
+                "phase": names[min(i, len(names)-1)],
+                "start_s": s["start_s"], "end_s": s["end_s"],
+                "what_happens": "visible action per segment",
+                "camera_notes": "", "audio_notes": "silent",
+                "on_screen_text": "", "evidence": [f"kf@{round((s['start_s']+s['end_s'])/2,2)}"]
+            } for i, s in enumerate(segs)]
 
     st.success("Analysis complete.")
     with st.expander("Analyzer JSON", expanded=True):
@@ -258,29 +255,63 @@ JSON you produced:
 
     st.subheader("Analyzer Signals")
     gs = analysis.get("global_signals", {})
-    arch = analysis.get("archetype") or analysis.get("analysis", {}).get("archetype", "")
-    st.write(f"**Archetype:** {arch or '(see JSON)'}")
-    st.write(f"**Speech presence:** {gs.get('speech_presence','?')}  |  **Tempo:** {gs.get('tempo','?')}")
+    st.write(f"**Archetype:** {analysis.get('archetype','(see JSON)')}  |  **Speech:** {gs.get('speech_presence','?')}  |  **Tempo:** {gs.get('tempo','?')}")
 
+    # Phase previews
     try:
         phases = analysis.get("phases") or analysis.get("analysis", {}).get("phases", [])
         imgs: List[Tuple[str, Image.Image]] = images_for_display(str(video_path), phases)
         if imgs:
             st.subheader("Reference Keyframes")
-            cols = st.columns(min(3, len(imgs)))
+            cols = st.columns(min(2, len(imgs)))
             for i, (label, img) in enumerate(imgs):
                 with cols[i % len(cols)]:
                     st.image(img, caption=label, use_container_width=True)
     except Exception as e:
         st.warning(f"Could not render phase keyframes: {e}")
 
+    # 4) Web research (optional)
+    research = {"query":"", "sources":[], "claims":[], "disclaimers":[], "features":[]}
+    if auto_research:
+        with st.spinner("Researching the product on the web…"):
+            research = research_product(brand, product, max_results=6)
+        st.subheader("Web Research")
+        if not (research["claims"] or research["features"]):
+            st.info("No research data (network restricted or no suitable sources found).")
+        else:
+            st.markdown("**Sources**")
+            for s in research["sources"]:
+                st.write(f"- [{s['title']}]({s['url']})")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Suggested feature claims** (editable in the box below):")
+                for c in research["claims"][:10]:
+                    st.write(f"• {c}")
+            with col2:
+                if research["disclaimers"]:
+                    st.markdown("**Suggested disclaimers**")
+                    for d in research["disclaimers"][:8]:
+                        st.write(f"• {d}")
+
+    # Merge manual + research for the script
+    def _dedupe(lst): 
+        seen=set(); out=[]
+        for x in lst:
+            k=x.strip().lower()
+            if k and k not in seen:
+                seen.add(k); out.append(x.strip())
+        return out
+    final_claims = _dedupe((approved_claims_manual or []) + (research.get("claims") or []))
+    final_disclaimers = _dedupe((required_disclaimers_manual or []) + (research.get("disclaimers") or []))
+
+    # 5) Script generation
     with st.spinner("Generating script & shot list…"):
         script_prompt = build_script_messages(
             analyzer_json=analysis,
             brand=brand,
             product=product,
-            approved_claims=[c for c in approved_claims if c.strip()],
-            required_disclaimers=[d for d in required_disclaimers if d.strip()],
+            approved_claims=final_claims,
+            required_disclaimers=final_disclaimers,
             target_runtime_s=float(target_runtime),
             platform=platform,
             brand_voice={},
@@ -300,29 +331,18 @@ JSON you produced:
     with st.expander("Script JSON", expanded=True):
         st.json(script_json)
 
+    # 6) PDF export
     if pe is not None:
         try:
-            # Prefer build_pdf if present; otherwise, try legacy names.
-            if hasattr(pe, "build_pdf"):
-                pdf_bytes: bytes = pe.build_pdf(
-                    brand_header=pdf_brand,
-                    footer_note=pdf_footer,
-                    product_meta={"brand": brand, "name": product, "platform": platform},
-                    analysis=analysis,
-                    plan=script_json,
-                    phase_images=imgs if 'imgs' in locals() else [],
-                )
-            elif hasattr(pe, "create_pdf"):
-                pdf_bytes = pe.create_pdf(
-                    brand_header=pdf_brand,
-                    footer_note=pdf_footer,
-                    product_meta={"brand": brand, "name": product, "platform": platform},
-                    analysis=analysis,
-                    plan=script_json,
-                    phase_images=imgs if 'imgs' in locals() else [],
-                )
-            else:
-                raise AttributeError("pdf_export has no build_pdf/create_pdf")
+            pdf_bytes: bytes = pe.build_pdf(
+                brand_header=pdf_brand,
+                footer_note=pdf_footer,
+                product_meta={"brand": brand, "name": product, "platform": platform},
+                analysis=analysis,
+                plan=script_json,
+                phase_images=imgs if 'imgs' in locals() else [],
+                research=research,
+            )
             st.subheader("Export PDF")
             st.download_button("⬇️ Download PDF", data=pdf_bytes, file_name=f"brief_{product}.pdf", mime="application/pdf")
         except Exception as e:
