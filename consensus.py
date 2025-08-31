@@ -1,147 +1,119 @@
 # consensus.py
 from __future__ import annotations
-from typing import List, Dict, Any, Callable, Tuple
-from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
 from collections import defaultdict, Counter
 import re
 
+# Optional unit normalization
 try:
-    from pint import UnitRegistry  # pip install pint
-    UREG = UnitRegistry()
+    from pint import UnitRegistry
+    _ureg = UnitRegistry()
 except Exception:
-    UREG = None
-
-@dataclass
-class Claim:
-    key: str
-    value: str
-    source: str
-    snippet: str
-    kind: str  # "spec" | "feature" | "disclaimer"
+    _ureg = None
 
 NUMERIC_KEYS = {
-    "weight","capacity","battery_life","power","screen","ip_rating",
-    "dimensions","load_capacity","packed_size","seat_height",
+    "weight", "capacity", "battery_life", "power", "screen", "ip_rating",
+    "load_capacity", "seat_height"
 }
 
-# Normalize strings (for features)
-def _norm_phrase(s: str) -> str:
-    s = s.strip().lower()
-    s = re.sub(r"[^\w\s×x\.\-:/]", "", s)
-    s = re.sub(r"\s+", " ", s)
-    return s
+DIMENSION_KEYS = {"dimensions", "packed_size"}
 
-def _is_numeric_like(key: str) -> bool:
-    return key in NUMERIC_KEYS
+def _norm_number_text(val: str) -> str:
+    # strip commas/spaces
+    return re.sub(r"\s+", " ", (val or "")).strip()
 
-def _normalize_units(key: str, value: str) -> str:
-    if not UREG:
-        return value
-    try:
-        v = value
-        # Very light normalization cases:
-        if key in ("weight","load_capacity"):
-            # extract number + unit
-            m = re.search(r"([\d\.]+)\s*(kg|g|lbs?|pounds|oz)", value.lower())
-            if not m:
-                return value
+def normalize_units(specs: Dict[str,str]) -> Dict[str,str]:
+    """Normalize common units when pint is available; otherwise return as-is."""
+    if not _ureg:
+        return specs
+    out = dict(specs)
+    # weight
+    if "weight" in out:
+        m = re.search(r"([\d\.]+)\s*(kg|g|lb|lbs|pounds|oz)", out["weight"], re.I)
+        if m:
             qty = float(m.group(1))
-            unit = m.group(2)
-            q = qty * UREG(unit)
-            # standardize to kg (one decimal)
-            kg = q.to(UREG.kg).magnitude
-            return f"{kg:.2f} kg"
-        if key in ("dimensions","packed_size","screen","seat_height"):
-            # Keep as-is; dimensions often "X × Y × Z in/cm"
-            v = value.replace("x", "×")
-            return v
-        if key in ("capacity","battery_life","power","ip_rating","materials"):
-            return value
-        return value
-    except Exception:
-        return value
+            unit = m.group(2).lower().replace("pounds","lb").replace("lbs","lb")
+            try:
+                q = (qty * _ureg(unit)).to(_ureg.kilogram)
+                out["weight"] = f"{q.magnitude:.2f} kg"
+            except Exception:
+                pass
+    # seat_height as cm
+    if "seat_height" in out:
+        m = re.search(r"([\d\.]+)\s*(cm|mm|in|\"|')", out["seat_height"], re.I)
+        if m:
+            qty = float(m.group(1)); unit = m.group(2).lower().replace("\"","in").replace("'","ft")
+            try:
+                q = (qty * _ureg(unit)).to(_ureg.cm)
+                out["seat_height"] = f"{q.magnitude:.1f} cm"
+            except Exception:
+                pass
+    # dimensions/packed_size — standardize separator to ×
+    for key in ("dimensions","packed_size"):
+        if key in out:
+            out[key] = out[key].replace("x","×").replace("X","×")
+    return out
 
-def _pick_numeric(claims: List[Claim], brand: str, is_manufacturer) -> Tuple[str, float, List[Dict[str,str]]]:
-    # prefer manufacturer; else majority (normalized)
-    by_norm: Dict[str, List[Claim]] = defaultdict(list)
-    for c in claims:
-        norm = _normalize_units(c.key, c.value)
-        by_norm[norm].append(c)
-    # manufacturer boost
-    def score_group(vals: List[Claim]) -> float:
-        score = len(vals)
-        if any(is_manufacturer(v.source, brand) for v in vals):
-            score += 2.5
-        return score
-    best_norm = max(by_norm.keys(), key=lambda k: score_group(by_norm[k]))
-    chosen = by_norm[best_norm]
-    conf = min(0.95, 0.45 + 0.15 * len(chosen) + (0.25 if any(is_manufacturer(v.source, brand) for v in chosen) else 0))
-    sources = [{"url": c.source, "snippet": c.snippet} for c in chosen]
-    return best_norm, conf, sources
+def _conf_from_sources(count: int, manufacturer_present: bool) -> float:
+    if manufacturer_present:
+        return 0.92 if count >= 1 else 0.7
+    # non-manufacturer: raise with more independent sources
+    return min(0.9, 0.55 + 0.15 * max(0, count-1))
 
-def consolidate_claims(
-    claims: List[Claim],
-    brand: str,
-    min_confidence: float = 0.6,
-    is_manufacturer: Callable[[str, str], bool] = lambda url, brand: False,
-) -> Dict[str, Any]:
-    by_key: Dict[str, List[Claim]] = defaultdict(list)
-    feats: List[Dict[str, Any]] = []
-    discls: List[Dict[str, Any]] = []
-    notes: List[str] = []
+def consolidate_claims(raw_claims: List[Any], brand_token: str) -> Dict[str, Any]:
+    """
+    raw_claims: list of product_research.Claim
+    Returns {"features":[...], "specs":[...]}
+    """
+    # bucket by key/value (normalized)
+    spec_bucket: Dict[str, Dict[str, List[Any]]] = defaultdict(lambda: defaultdict(list))
+    feat_bucket: Dict[str, List[Any]] = defaultdict(list)
 
-    for c in claims:
-        by_key[c.key].append(c)
+    for c in raw_claims:
+        if c.kind == "spec":
+            k = c.key.lower().strip()
+            v = _norm_number_text(c.value)
+            spec_bucket[k][v].append(c)
+        elif c.kind == "feature":
+            v = c.value.strip()
+            feat_bucket[v].append(c)
 
-    specs_out: List[Dict[str, Any]] = []
+    # specs: choose manufacturer > majority (unit-normalized when possible)
+    specs_out = []
+    for key, valmap in spec_bucket.items():
+        # Flatten to count sources and manufacturer presence
+        best_v, best_score = None, -1.0
+        for v, lst in valmap.items():
+            manu = any(x.manufacturer for x in lst)
+            conf = _conf_from_sources(len(lst), manu)
+            # prefer manufacturer, else more sources, else higher page score sum
+            tie = (1 if manu else 0, len(lst), sum(x.score for x in lst))
+            score = conf * 10 + tie[0]*5 + tie[1]*0.2 + tie[2]*0.01
+            if score > best_score:
+                best_score = score
+                best_v = (v, lst, manu, conf)
+        if best_v:
+            v, lst, manu, conf = best_v
+            specs_out.append({
+                "key": key,
+                "value": v,
+                "sources": [{"url": x.source, "manufacturer": x.manufacturer} for x in lst],
+                "confidence": float(f"{conf:.3f}")
+            })
 
-    # Specs (numeric-like keys)
-    for key, lst in by_key.items():
-        if key == "feature" or key == "disclaimer":
-            continue
-        if _is_numeric_like(key):
-            val, conf, srcs = _pick_numeric(lst, brand, is_manufacturer)
-            if conf >= min_confidence:
-                specs_out.append({"key": key, "value": val, "sources": srcs, "confidence": conf})
-        else:
-            # non-numeric spec (e.g., materials string)
-            # group by normalized strings
-            bucket: Dict[str, List[Claim]] = defaultdict(list)
-            for c in lst:
-                bucket[_norm_phrase(c.value)].append(c)
-            best = max(bucket.keys(), key=lambda k: len(bucket[k]))
-            chosen = bucket[best]
-            conf = min(0.9, 0.4 + 0.2 * len(chosen) + (0.25 if any(is_manufacturer(v.source, brand) for v in chosen) else 0))
-            if conf >= min_confidence:
-                specs_out.append({"key": key, "value": chosen[0].value, "sources": [{"url": x.source, "snippet": x.snippet} for x in chosen], "confidence": conf})
+    # features: accept if manufacturer or ≥2 sources
+    feats_out = []
+    for text, lst in feat_bucket.items():
+        manu = any(x.manufacturer for x in lst)
+        if manu or len(lst) >= 2:
+            conf = _conf_from_sources(len(lst), manu)
+            feats_out.append({
+                "text": text,
+                "sources": [{"url": x.source, "manufacturer": x.manufacturer} for x in lst],
+                "confidence": float(f"{conf:.3f}")
+            })
 
-    # Features
-    feat_vals: Dict[str, List[Claim]] = defaultdict(list)
-    for c in by_key.get("feature", []):
-        feat_vals[_norm_phrase(c.value)].append(c)
-    for val_norm, lst in feat_vals.items():
-        conf = min(0.9, 0.35 + 0.15 * len(lst) + (0.25 if any(is_manufacturer(v.source, brand) for v in lst) else 0))
-        if conf >= min_confidence or len(lst) >= 2:
-            feats.append({"text": lst[0].value, "sources": [{"url": x.source, "snippet": x.snippet} for x in lst], "confidence": conf})
-
-    # Disclaimers
-    disc_vals: Dict[str, List[Claim]] = defaultdict(list)
-    for c in by_key.get("disclaimer", []):
-        disc_vals[_norm_phrase(c.value)].append(c)
-    for _, lst in disc_vals.items():
-        conf = min(0.9, 0.35 + 0.15 * len(lst) + (0.25 if any(is_manufacturer(v.source, brand) for v in lst) else 0))
-        if conf >= min_confidence or len(lst) >= 2:
-            discls.append({"text": lst[0].value, "sources": [{"url": x.source, "snippet": x.snippet} for x in lst], "confidence": conf})
-
-    # Keep some raw short claims for debugging (not used to script)
-    claims_out = []
-    for c in claims[:30]:
-        claims_out.append({"key": c.key, "value": c.value, "source": c.source})
-
-    return {
-        "specs": specs_out,
-        "features": feats[:20],
-        "disclaimers": discls[:10],
-        "claims": claims_out,
-        "notes": notes,
-    }
+    # sort by confidence descending
+    specs_out.sort(key=lambda x: x["confidence"], reverse=True)
+    feats_out.sort(key=lambda x: x["confidence"], reverse=True)
+    return {"specs": specs_out, "features": feats_out}
