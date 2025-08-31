@@ -223,7 +223,7 @@ if run_btn:
         duration = extract_duration(str(video_path)) or 0.0
         kfs = grab_even_keyframes(str(video_path), every_s=2.0, limit=18)  # [{"t","image_path"}]
         key_ts = [x["t"] for x in kfs]
-        ocr = ocr_images(kfs)  # [{"t","lines":[...],"image_path": str}]
+        ocr = ocr_images(kfs)  # [{"t","lines":[...]}]
         cap_den = caption_density(ocr)
         transcript = transcribe_audio(str(video_path)) or ""
         sp_ratio = speech_proxy(transcript, cap_den)
@@ -276,7 +276,7 @@ JSON you produced:
 """
             analysis = gemini_json(fix_prompt) if provider == "Gemini" else openai_json(fix_prompt)
 
-        # Fallback: if SHOWCASE and model returned ≤1 phase for a clip ≥10s, create 2–3 coarse phases from scene_candidates
+        # Fallback segmentation for silent SHOWCASE
         arch = analysis.get("archetype") or analysis.get("analysis", {}).get("archetype", "")
         phases = analysis.get("phases") or analysis.get("analysis", {}).get("phases", [])
         if arch == "SHOWCASE" and duration >= 10 and len(phases) <= 1:
@@ -381,8 +381,19 @@ JSON you produced:
                 out.append(x.strip())
         return out
 
-    # Treat research["features"] as safe, non-comparative "approved claims" when manual list is empty
-    final_claims = _dedupe((approved_claims_manual or []) + (research.get("claims") or []) + (research.get("features") or []))
+    # Convert specs into safe bullets for script grounding
+    spec_bullets: List[str] = []
+    for k, v in (research.get("specs") or {}).items():
+        if v:
+            spec_bullets.append(f"{k.title()}: {v}")
+
+    # Prefer concrete features/specs first, then any short clean sentences
+    final_claims = _dedupe(
+        (approved_claims_manual or [])
+        + (research.get("features") or [])
+        + spec_bullets
+        + (research.get("claims") or [])
+    )
     final_disclaimers = _dedupe((required_disclaimers_manual or []) + (research.get("disclaimers") or []))
 
     # 5) Script generation
@@ -391,7 +402,7 @@ JSON you produced:
             analyzer_json=analysis,
             brand=brand,
             product=product,
-            approved_claims=final_claims,          # includes web features if manual empty
+            approved_claims=final_claims,
             required_disclaimers=final_disclaimers,
             target_runtime_s=float(target_runtime),
             platform=platform,
