@@ -1,35 +1,108 @@
-# llm.py — Gemini JSON-only helper
+# llm.py
+# Thin JSON-only wrappers for Gemini and OpenAI with robust key loading.
 
-import os
-import time
-from typing import Optional
-import google.generativeai as genai
+from __future__ import annotations
+import os, json, re
+from typing import Any, Dict, Optional
 
-def _configure():
-    key = None
+
+def _get_secret(key: str) -> Optional[str]:
+    """Try env first, then Streamlit secrets if available."""
+    val = os.getenv(key)
+    if val:
+        return val
     try:
-        import streamlit as st
-        key = st.secrets.get("GOOGLE_API_KEY", None)  # type: ignore[attr-defined]
+        import streamlit as st  # optional
+        if key in st.secrets:
+            return st.secrets[key]
     except Exception:
         pass
-    key = key or os.getenv("GOOGLE_API_KEY")
-    if not key:
-        raise RuntimeError("GOOGLE_API_KEY not set (Streamlit Cloud → Settings → Secrets).")
-    genai.configure(api_key=key)
+    return None
 
-def gemini_json(prompt_text: str, model: str = "gemini-1.5-pro", temperature: float = 0.2,
-                max_retries: int = 3, retry_base: float = 1.5) -> str:
-    _configure()
-    last_err: Optional[Exception] = None
-    for i in range(max_retries):
+
+def _extract_json(text: str) -> Dict[str, Any]:
+    """Best-effort JSON parse for occasionally noisy model outputs."""
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
         try:
-            mdl = genai.GenerativeModel(model)
-            resp = mdl.generate_content(
-                prompt_text,
-                generation_config={"temperature": temperature, "response_mime_type": "application/json"}
-            )
-            return resp.text or "{}"
-        except Exception as e:
-            last_err = e
-            time.sleep(retry_base * (i + 1))
-    raise RuntimeError(f"Gemini call failed after retries: {last_err}")
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return {"raw": text}
+
+
+def openai_json(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    system: str = "",
+    temperature: float = 0.2,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Call OpenAI Chat Completions and force a JSON object response."""
+    from openai import OpenAI
+
+    api_key = _get_secret("OPENAI_API_KEY")
+    client = OpenAI(api_key=api_key)  # uses env var internally if None
+
+    model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        response_format={"type": "json_object"},
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    text = resp.choices[0].message.content or ""
+    return _extract_json(text)
+
+
+def gemini_json(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    system: str = "",
+    temperature: float = 0.2,
+) -> Dict[str, Any]:
+    """Call Gemini and force a JSON object response."""
+    import google.generativeai as genai
+
+    api_key = _get_secret("GOOGLE_API_KEY")
+    if not api_key:
+        # Helpful error for Streamlit Cloud users
+        raise RuntimeError(
+            "GOOGLE_API_KEY is not set. Add it via Streamlit secrets or environment."
+        )
+    genai.configure(api_key=api_key)
+
+    model = model or os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+    full_prompt = (system + "\n\n" + prompt).strip() if system else prompt
+
+    g = genai.GenerativeModel(model)
+    resp = g.generate_content(
+        full_prompt,
+        generation_config={
+            "response_mime_type": "application/json",
+            "temperature": temperature,
+        },
+    )
+
+    # google-generativeai returns .text for the aggregated string
+    text = getattr(resp, "text", None)
+    if not text:
+        # Fallback: concatenate text parts if present
+        try:
+            parts = resp.candidates[0].content.parts
+            text = "".join(getattr(p, "text", "") for p in parts)
+        except Exception:
+            text = ""
+    return _extract_json(text or "{}")
