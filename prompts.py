@@ -1,66 +1,60 @@
 # prompts.py
-# Prompt builders (Analyzer + Style-Transfer Script) with strict schemas
+# Prompt builders (Analyzer + Script) with archetype-aware schemas.
 
 import json
 from typing import Any, Dict, List, Optional
 
-# ===== Analyzer schema (model output we expect) =====
+# ===== Archetype-aware Analyzer schema example =====
 ANALYZER_SCHEMA_EXAMPLE = {
     "video_metadata": {
         "platform": "tiktok|reels|ytshorts",
         "duration_s": 19.8,
         "aspect_ratio": "9:16",
     },
-    "narrative": [
-        {"phase": "hook",        "start_s": 0.0,  "end_s": 1.5,  "purpose": "pattern interrupt"},
-        {"phase": "pain_point",  "start_s": 1.5,  "end_s": 4.0,  "purpose": "relatable problem"},
-        {"phase": "solution",    "start_s": 4.0,  "end_s": 11.0, "purpose": "introduce product/approach"},
-        {"phase": "proof",       "start_s": 11.0, "end_s": 16.0, "purpose": "demo/social proof/benefit"},
-        {"phase": "cta",         "start_s": 16.0, "end_s": 19.8, "purpose": "clear action or loop"}
-    ],
-    "influencer_DNA": {
-        "persona": "relatable, dry humor",
-        "energy": "medium-high",
-        "tone": "conversational, confident",
-        "camera_presence": "handheld, faces camera",
-        "edit_grammar": ["hard cuts", "caption pops", "sound effect hits"],
-        "retention_devices": ["quick reveal", "jump cuts", "countdown timer"],
+    "global_signals": {
+        "speech_presence": "none|low|medium|high",
+        "music_presence": True,
+        "tempo": "calm|moderate|fast",
+        "setting": "indoor|outdoor|store|desk|campsite|unknown"
     },
-    "beats": [
-        {"t_s": 0.0,  "type": "cut"},
-        {"t_s": 1.6,  "type": "caption_pop"},
-        {"t_s": 4.2,  "type": "product_reveal"},
-        {"t_s": 7.5,  "type": "whoosh_hit"},
-        {"t_s": 16.0, "type": "cta_overlay"}
-    ],
-    "keyframes": [
-        {"t_s": 0.0,  "image_ref": "kf_01.jpg", "why": "hook text burst"},
-        {"t_s": 4.5,  "image_ref": "kf_02.jpg", "why": "macro product demo"},
-        {"t_s": 16.0, "image_ref": "kf_03.jpg", "why": "CTA overlay"}
-    ],
-    "scenes": [
+    "archetype": "SHOWCASE|NARRATIVE|TUTORIAL|COMPARISON|TEST_DEMO|TESTIMONIAL_UGC|TIMELAPSE|ANNOUNCEMENT",
+    "confidence": 0.86,
+
+    # Lightweight phase list that depends on archetype.
+    # SHOWCASE examples: Unbox, Handle/Features, Demo, Outro
+    # NARRATIVE examples: Hook, Problem, Solution, Proof, CTA
+    "phases": [
         {
-            "idx": 1,
+            "phase": "Unbox|Handle/Features|Demo|Outro|Hook|Problem|Solution|Proof|CTA|Step 1|Step 2|Comparison Setup|Test|Result",
             "start_s": 0.0,
-            "end_s": 3.8,
-            "camera": "front camera, chest-up",
-            "action": "creator addresses camera",
-            "dialogue": "…",
-            "on_screen_text": ["Line 1", "Line 2"],  # <= 2 short lines
-            "transition_out": "hard cut",
-            "sfx_or_music": "whoosh at 0.2s",
-            "retention_note": "promise result quickly"
+            "end_s": 4.0,
+            "what_happens": "concise, visible action",
+            "camera_notes": "CU/MS/WS; moves if obvious",
+            "audio_notes": "speech|silent|ambient|music",
+            "on_screen_text": "short label if present else ''",
+            "evidence": ["kf@0.0", "ocr@'Quick-fold latch'"]
         }
     ],
+
+    "keyframes": [
+        {"t_s": 0.0,  "image_ref": "kf_01.jpg", "why": "unbox moment"},
+        {"t_s": 9.2,  "image_ref": "kf_02.jpg", "why": "latch close-up"},
+        {"t_s": 16.0, "image_ref": "kf_03.jpg", "why": "stability demo"}
+    ],
+
+    "visible_product_features": ["folding frame","quick-fold latch","cup holder","carry bag"],
+
     "compliance": {
         "sensitive_claims_detected": [],
-        "notes": "no medical claims"
+        "notes": "no medical claims; no certifications"
     },
-    "transferable_patterns": [
-        "open with pattern interrupt text burst",
-        "macro close-up timed to sound hit",
-        "CTA as overlay, not spoken"
-    ]
+
+    "influencer_DNA": {
+        "persona": "hands-only; no dialogue",
+        "pacing": "calm",
+        "visual_motifs": ["macro texture", "slow pans"],
+        "edit_habits": ["hard cuts", "minimal captions"]
+    }
 }
 
 
@@ -75,7 +69,7 @@ def build_analyzer_messages(
 ) -> str:
     """
     Build a single text prompt for Gemini that requests JSON only.
-    We pass a compact EVIDENCE JSON and show the exact schema we want back.
+    We pass compact EVIDENCE and show the exact schema we want back.
     """
     evidence = {
         "platform": platform,
@@ -87,66 +81,67 @@ def build_analyzer_messages(
     }
 
     prompt = f"""
-You are a director-level video analyst. Given the EVIDENCE below from a short-form video,
-return JSON ONLY matching the schema that follows. Do not include extra keys or commentary.
+You are a director-level video analyst for short-form content (TikTok/Reels/Shorts).
+Given EVIDENCE from a reference video, return JSON ONLY matching the schema below. Do not include any extra keys or commentary.
 
 EVIDENCE (JSON):
 {json.dumps(evidence, ensure_ascii=False)}
 
-DESIRED_OUTPUT_SCHEMA (JSON EXAMPLE):
-{json.dumps(ANALYZER_SCHEMA_EXAMPLE, ensure_ascii=False, indent=2)}
+INSTRUCTIONS:
+- First, infer speech presence:
+  - If transcript_text is empty or only a few words and OCR shows few/no captions, set "speech_presence" = "none" or "low".
+- Choose exactly one "archetype" from:
+  SHOWCASE, NARRATIVE, TUTORIAL, COMPARISON, TEST_DEMO, TESTIMONIAL_UGC, TIMELAPSE, ANNOUNCEMENT.
+  *SHOWCASE* is common for ASMR/unbox/feature demos with little/no speech.
+- Output only the phases that truly exist for the detected archetype:
+  - SHOWCASE: use Unbox / Handle/Features / Demo / Outro if present. Do NOT invent Problem/Solution/CTA unless clear evidence exists.
+  - NARRATIVE: Hook / Problem / Solution / Proof / CTA if supported by speech or visible captions.
+  - TUTORIAL: Step 1..N with brief actions.
+  - COMPARISON: Comparison Setup / Side-by-side Test / Result.
+- Every phase MUST include an "evidence" array that references items from the EVIDENCE (e.g., "kf@9.2", "ocr@'Quick-fold latch'"). If unsure, leave "evidence" empty but prefer omission over hallucination.
+- Keep times reasonable and non-overlapping; omit times if unknown.
+- Only list "visible_product_features" that can plausibly be seen in keyframes/visuals.
+- Include a single "influencer_DNA" block with persona/pacing/motifs/edit_habits inferred from visuals.
 
-Hard requirements:
-- Include ALL phases: hook, pain_point, solution, proof, cta — covering the FULL runtime (0s → duration).
-- Produce a beat grid ('beats'): cut/impact times you can infer.
-- Include influencer_DNA (persona, energy, tone, camera_presence) + edit_grammar + retention_devices.
-- 'scenes' MUST be contiguous, no gaps/overlaps, and cover 0s → duration. Each scene includes transition_out and sfx_or_music.
-- 'on_screen_text' per scene: ≤ 2 short lines (7–10 words max/line), based on overlays or inferred intent.
-- 'keyframes' must reference provided keyframe file names ('image_ref' is the basename from paths) and include a brief 'why'.
-- Keep language concise. Output JSON ONLY.
+Return JSON ONLY with this top-level structure:
+{json.dumps(ANALYZER_SCHEMA_EXAMPLE, ensure_ascii=False, indent=2)}
 """
     return prompt
 
 
-# ===== Script schema (model output we expect) =====
+# ===== Script schema example (unchanged structure, works for both modes) =====
 SCRIPT_SCHEMA_EXAMPLE = {
-    "product": {"brand": "Siawag", "name": "BTW73"},
+    "product": {"brand": "Brand", "name": "Product"},
     "target_runtime_s": 20.0,
     "style_transfer": {
-        "preserve": ["hook cadence", "caption pops", "CTA overlay"],
-        "adapt": ["replace beauty macro with earbud case macro"],
-        "affordance_map": [
-            {"from": "lipstick swatch", "to": "tap earbud to change ANC mode"}
-        ],
+        "preserve": ["cadence", "visual motifs"],
+        "adapt": ["map actions to this product"],
+        "affordance_map": [{"from": "orig action", "to": "new product action"}],
     },
     "script": {
-        "opening_hook": "Quick line that matches the style and sets the promise.",
+        # Keep opening optional for showcase; model may leave it short/empty
+        "opening_hook": "Optional quick line or empty for showcase.",
         "scenes": [
             {
                 "idx": 1,
                 "start_s": 0.0,
                 "end_s": 3.5,
-                "camera": "front camera, chest-up",
-                "action": "Creator raises case, pops open",
-                "dialogue": "You ever open your earbuds and…",
-                "on_screen_text": ["Instant connect", "ENC calls"],  # <= 2 lines
-                "transition_out": "hard cut",
-                "sfx_or_music": "whoosh at 0.2s",
-                "retention_note": "promise payoff by 5s"
+                "camera": "WS/MS/CU; movement if any",
+                "action": "what we film",
+                "on_screen_text": ["≤2 short lines"],
+                "voiceover": "'' if none",
+                "sfx_or_music": "if any",
+                "transition_out": "hard cut|crossfade"
             }
-        ],
-        "cta_options": [
-            {"variant": "hard", "line": "Tap to shop the BTW73s."},
-            {"variant": "loop", "line": "Watch how fast they connect →"}
-        ],
+        ]
     },
-    "notes_for_legal": [
-        "No superlatives or competitor comparisons.",
-        "Keep claims to whitelist only."
-    ],
+    "ctas": {
+        "hard": "Check our TikTok Shop for details.",
+        "loop": "See part 2 in my profile."
+    },
     "checklist": [
-        "Safe area: on-screen text max 2 lines, high contrast",
-        "Match cuts to SFX beats"
+        "Safe area: 2 short OSD lines max; high contrast",
+        "Keep beats clear; no hype words if brand voice forbids"
     ]
 }
 
@@ -164,6 +159,8 @@ def build_script_messages(
 ) -> str:
     """
     Build a script-generation prompt that performs style transfer using Analyzer output.
+    Archetype-aware: If archetype=SHOWCASE or speech_presence is none/low,
+    do NOT force Problem/Solution; keep VO optional and minimal.
     """
     voice = brand_voice or {}
     scaffold = {
@@ -177,18 +174,24 @@ def build_script_messages(
     }
 
     prompt = f"""
-You are a short-form video creative director. Using the ANALYZER JSON of a reference video,
+You are a short-form video creative director. Using the ANALYZER JSON of the reference video,
 produce a NEW script that transfers the style to a different product while respecting claim safety.
 
 Return JSON ONLY matching the SCRIPT schema below. Do not include commentary.
 
-CONSTRAINTS:
-- Use ONLY the provided approved_claims. Do not invent claims.
-- Scenes MUST be contiguous from 0s to target_runtime_s (±0.5s), with transition_out and sfx_or_music for every scene.
-- on_screen_text per scene: ≤ 2 lines, short, 7–10 words per line, safe-area friendly.
-- Keep tone consistent with influencer_DNA from the Analyzer, but adapt to brand_voice if given.
-- Include 'style_transfer.affordance_map' to show how original actions transform to this product category.
-- Include two CTA variants: 'hard' and 'loop'.
+ARCHETYPE LOGIC:
+- If ANALYZER.archetype is SHOWCASE or global_signals.speech_presence is none/low:
+  - Do NOT invent pain points or solutions.
+  - Voiceover is optional (0–2 very short lines total); it’s okay to leave VO empty.
+  - Focus on visual actions that mirror the reference phases (Unbox → Handle/Features → Demo → Outro).
+- If NARRATIVE (or Tutorial/Comparison): Use phases appropriate to the analysis (Hook/Problem/Solution/Proof/CTA OR Steps/Tests),
+  but only when the analyzer phases indicate such beats (or speech/captions support them).
+
+HARD RULES:
+- Use ONLY the provided approved_claims. Do not invent claims, certifications, or metrics.
+- Scenes should roughly cover 0s→target_runtime_s with minimal gaps; keep times sensible (±0.5s tolerance ok).
+- on_screen_text per scene ≤ 2 lines; 7–10 words each; safe-area friendly.
+- Add 'style_transfer.affordance_map' to show how original actions translate to this product.
 
 ANALYZER (JSON):
 {json.dumps(analyzer_json, ensure_ascii=False)}
