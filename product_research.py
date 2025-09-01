@@ -1,14 +1,10 @@
-# product_research.py — v5.1  (2025-09-01)
+# product_research.py — 2025-09-01
 """
-Open-web product-info engine (no paid APIs).
+Product-info engine for briefgenv2.
 
-Adds FEATURE extraction:
-• Looks for <ul>/<li> blocks under divs whose class/id hints "feature", "spec",
-  "description", etc.
-• Deduplicates & normalises bullets
-• research_product(...) now returns:
-      "features"            → List[str]    (short bullets, merged)
-      "features_detailed"   → List[{"feature": str, "sources": [...] }]
+• First tries open-web scraping (Google SERP + HTML/PDF parsing).
+• If nothing verified, falls back to Gemini-Pro via gemini_fetcher.py.
+• Returns dict that app.py already expects.
 """
 
 from __future__ import annotations
@@ -20,6 +16,7 @@ from typing import Dict, List, Any, Tuple
 from rapidfuzz import fuzz
 from pint import UnitRegistry
 
+# ── local deps ──
 from fetcher import (
     search_serp,
     fetch_html,
@@ -31,7 +28,7 @@ ureg = UnitRegistry(auto_reduce_dimensions=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ────────────────── config ──────────────────
+# ────────────────── static config ──────────────────
 WHITELIST_HINTS = [
     "amazon.", "bestbuy.", "walmart.", "target.", "homedepot.", "newegg.",
     "bhphotovideo.", "lenovo.", "dell.", "asus.", "acer.", "apple.",
@@ -73,24 +70,19 @@ def _norm_val(k: str, v: str) -> str:
 
 def _host(u: str) -> str:
     from urllib.parse import urlparse
-    try:
-        return (urlparse(u).hostname or "").lower()
-    except Exception:
-        return u.lower()
+    return (urlparse(u).hostname or "").lower()
 
 def _url_ok(u: str) -> bool:
     h = _host(u)
-    if any(d in h for d in DENY_HINTS):
-        return False
-    return True
+    return not any(d in h for d in DENY_HINTS)
 
-# ────────────────── core dataclasses ──────────────────
+# ────────────────── data classes ──────────────────
 @dataclass
 class SpecRecord:
     brand: str
     model: str
     specs: Dict[str, str] = field(default_factory=dict)
-    features: Dict[str, set] = field(default_factory=lambda: defaultdict(set))  # feat → set(urls)
+    features: Dict[str, set] = field(default_factory=lambda: defaultdict(set))  # feature → {urls}
     sources: Dict[str, Dict[str, str]] = field(default_factory=dict)           # url → attrs
     confidence: float = 0.0
 
@@ -113,7 +105,7 @@ class SpecRecord:
         diversity = len({ _host(u) for u in self.sources })
         self.confidence = min(1.0, (len(votes) / 7.0) * (1 + 0.1 * max(diversity - 1, 0)))
 
-# ────────────────── extraction helpers ──────────────────
+# ────────────────── HTML/PDF extraction ──────────────────
 def _extract_features_from_html(html: str) -> List[str]:
     try:
         from bs4 import BeautifulSoup
@@ -121,29 +113,24 @@ def _extract_features_from_html(html: str) -> List[str]:
         return []
     soup = BeautifulSoup(html, "html.parser")
     bullets: List[str] = []
-
-    # 1) <li> inside obvious feature blocks
     for tag in soup.find_all(["ul", "ol"]):
         wrapper = tag
-        for _ in range(3):                       # climb up a bit to inspect parents
-            if any(h in (wrapper.get("class") or []) for h in FEATURE_H1NTS):
+        for _ in range(3):
+            cls = " ".join(wrapper.get("class") or [])
+            if any(hint in cls.lower() for hint in FEATURE_H1NTS):
                 bullets.extend(li.get_text(" ", strip=True) for li in tag.find_all("li"))
                 break
             wrapper = wrapper.parent or wrapper
-
-    # 2) fallback: any <li> near the top that looks short & punchy
     if len(bullets) < 4:
         for li in soup.find_all("li")[:30]:
             txt = li.get_text(" ", strip=True)
             if 20 < len(txt) < 120:
                 bullets.append(txt)
-
-    # dedupe with fuzzy
     out: List[str] = []
     for b in bullets:
         if not any(fuzz.token_set_ratio(b, o) > 90 for o in out):
             out.append(b)
-    return out[:12]   # cap
+    return out[:12]
 
 def _extract_from_html(html: str, url: str) -> Tuple[Dict[str, str], List[str]]:
     attrs = dict(extract_structured_product(html, url).get("attributes", {}))
@@ -157,8 +144,8 @@ def _extract_from_html(html: str, url: str) -> Tuple[Dict[str, str], List[str]]:
                 attrs[k] = f"{m.group(1)} {m.group(2)}"
             else:
                 attrs[k] = m.group(1)
-    features = _extract_features_from_html(html)
-    return attrs, features
+    feats = _extract_features_from_html(html)
+    return attrs, feats
 
 def _extract_from_pdf(data: bytes) -> Dict[str, str]:
     try:
@@ -179,7 +166,7 @@ def _extract_from_pdf(data: bytes) -> Dict[str, str]:
                 attrs[k] = m.group(1)
     return attrs
 
-# ────────────────── public API ──────────────────
+# ────────────────── main function ──────────────────
 def get_product_record(brand: str, model: str, *, max_urls: int = 12) -> SpecRecord:
     rec = SpecRecord(brand, model)
     query = f"{brand} {model} specifications"
@@ -208,17 +195,36 @@ def get_product_record(brand: str, model: str, *, max_urls: int = 12) -> SpecRec
     rec.finalise()
     return rec
 
+# ────────────────── public wrapper (used by app.py) ──────────────────
 def research_product(
     brand: str,
     product: str,
     *,
     product_url_override: str = "",
-    vision_category_tags: List[str] | None = None,
     max_results: int = 12,
 ) -> Dict[str, Any]:
+    # 1) Try scraper first
     rec = get_product_record(brand, product, max_urls=max_results)
 
-    # Flatten features → lists
+    # 2) Fallback to Gemini if nothing verified and no manual URL
+    if not rec.specs and not rec.features and not product_url_override:
+        from gemini_fetcher import gemini_product_info
+        data = gemini_product_info(brand, product)
+        if data.get("status") == "OK":
+            for k, v in data.get("specs", {}).items():
+                rec.specs[k] = v
+            for idx, feat in enumerate(data.get("features", [])):
+                rec.features.setdefault(feat, set()).add("gemini")
+            for cit in data.get("citations", []):
+                attr = cit.get("attr")
+                url  = cit.get("url")
+                if attr and url:
+                    rec.sources.setdefault(url, {})
+                    if attr in rec.specs:
+                        rec.sources[url][attr] = rec.specs[attr]
+            rec.confidence = 0.9  # Gemini self-validated
+
+    # 3) Flatten return format
     simple_feats = list(rec.features.keys())
     detailed_feats = [
         {"feature": f, "sources": [{"url": u} for u in urls]}
