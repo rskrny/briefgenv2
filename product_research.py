@@ -1,18 +1,19 @@
-# product_research.py — 2025-09-01  (fix: features_detailed schema for app.py)
+# product_research.py — 2025-09-01  (align specs_detailed schema w/ app.py)
 """
 Product-info engine for briefgenv2.
 
-• Tries open-web scraping first.
-• If nothing verified, falls back to Gemini-Pro via gemini_fetcher.py.
-• Returns dict that app.py expects, including:
-    - features_detailed: List[{"text": str, "confidence": float, "sources": [{"url": str}, ...]}]
+• Tries open-web scraping first (SERP → HTML/PDF parse).
+• If nothing verified, falls back to Gemini via gemini_fetcher.py.
+• Returns object expected by app.py, including:
+    - features_detailed: [{"text": str, "confidence": float, "sources":[{"url":str},...]}]
+    - specs_detailed:    [{"key":  str, "value": str, "confidence": float, "sources":[{"url":str},...]}]
 """
 
 from __future__ import annotations
 import re, logging
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Set
 
 from rapidfuzz import fuzz
 from pint import UnitRegistry
@@ -67,7 +68,7 @@ def _norm_val(k: str, v: str) -> str:
             return f"{float(v):g} mAh"
     except Exception:
         pass
-    return v.strip()
+    return (v or "").strip()
 
 def _host(u: str) -> str:
     from urllib.parse import urlparse
@@ -83,21 +84,28 @@ class SpecRecord:
     brand: str
     model: str
     specs: Dict[str, str] = field(default_factory=dict)
-    # feature → set(urls). We also use the sentinel "gemini" as a pseudo-source.
+    # feature → set(urls). "gemini" may appear as a sentinel.
     features: Dict[str, set] = field(default_factory=lambda: defaultdict(set))
-    sources: Dict[str, Dict[str, str]] = field(default_factory=dict)  # url → attrs
+    # url → attrs extracted from that url
+    sources: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    # which spec keys were introduced by Gemini (no direct URL) — used for confidence/sources
+    specs_from_gemini: Set[str] = field(default_factory=set)
     confidence: float = 0.0
 
     def merge_specs(self, attrs: Dict[str, str], url: str):
-        self.sources[url] = attrs
+        if not attrs:
+            return
+        self.sources[url] = self.sources.get(url, {})
         for k, v in attrs.items():
             nk = k.lower()
+            self.sources[url][nk] = _norm_val(nk, v)
             if nk not in self.specs:
-                self.specs[nk] = _norm_val(nk, v)
+                self.specs[nk] = self.sources[url][nk]
 
     def merge_features(self, feats: List[str], url: str):
         for f in feats:
-            self.features[f].add(url)
+            if f and isinstance(f, str):
+                self.features[f].add(url)
 
     def finalise(self):
         votes = Counter()
@@ -115,11 +123,11 @@ def _extract_features_from_html(html: str) -> List[str]:
         return []
     soup = BeautifulSoup(html, "html.parser")
     bullets: List[str] = []
-    # Feature-ish blocks
+    # Feature-like blocks
     for tag in soup.find_all(["ul", "ol"]):
         wrapper = tag
         for _ in range(3):
-            cls = " ".join(wrapper.get("class") or [])
+            cls = " ".join(wrapper.get("class") or []) + " " + (wrapper.get("id") or "")
             if any(hint in cls.lower() for hint in FEATURE_HINTS):
                 bullets.extend(li.get_text(" ", strip=True) for li in tag.find_all("li"))
                 break
@@ -206,7 +214,7 @@ def research_product(
     product: str,
     *,
     product_url_override: str = "",
-    vision_category_tags: List[str] | None = None,   # accepted/ignored
+    vision_category_tags: List[str] | None = None,   # accepted & ignored
     max_results: int = 12,
 ) -> Dict[str, Any]:
     # 1) scraper
@@ -217,28 +225,33 @@ def research_product(
         from gemini_fetcher import gemini_product_info
         data = gemini_product_info(brand, product)
         if data.get("status") == "OK":
+            # record specs and mark they came from Gemini (in case no URL citations)
             for k, v in data.get("specs", {}).items():
-                rec.specs[k] = v
+                nk = k.lower()
+                rec.specs[nk] = _norm_val(nk, v)
+                rec.specs_from_gemini.add(nk)
+            # features
             for feat in data.get("features", []):
                 rec.features.setdefault(feat, set()).add("gemini")
+            # map citations to sources for specs if provided
             for cit in data.get("citations", []):
-                attr = cit.get("attr"); url = cit.get("url")
+                attr = (cit.get("attr") or "").lower()
+                url  = cit.get("url")
                 if attr and url:
                     rec.sources.setdefault(url, {})
                     if attr in rec.specs:
                         rec.sources[url][attr] = rec.specs[attr]
-            rec.confidence = 0.9  # Gemini self-validated
+            rec.confidence = 0.9  # high-level product record confidence
 
     # 3) Flatten for app.py
-    # Simple list of features
+    # Features (simple list)
     simple_feats = list(rec.features.keys())
 
-    # Detailed list with schema {text, confidence, sources}
+    # Features (detailed)
     detailed_feats: List[Dict[str, Any]] = []
     for ftxt, urls in rec.features.items():
         n = len([u for u in urls if u != "gemini"])
         used_gemini = ("gemini" in urls)
-        # Heuristic confidence: base on distinct sources plus Gemini bonus
         conf = 0.55 + 0.15 * min(n, 3) + (0.15 if used_gemini else 0.0)
         conf = max(0.5, min(0.95, conf))
         detailed_feats.append({
@@ -247,16 +260,28 @@ def research_product(
             "sources": [{"url": u} for u in urls if u != "gemini"] or [{"url": "gemini"}],
         })
 
+    # Specs (detailed: now with confidence + sources)
+    specs_detailed: List[Dict[str, Any]] = []
+    for k, v in rec.specs.items():
+        urls_with_attr = [u for u, attrs in rec.sources.items() if k in attrs]
+        n = len(urls_with_attr)
+        came_from_gemini = (k in rec.specs_from_gemini)
+        conf = 0.55 + 0.15 * min(n, 3) + (0.1 if came_from_gemini else 0.0)
+        conf = max(0.5, min(0.95, conf))
+        specs_detailed.append({
+            "key": k,
+            "value": v,
+            "confidence": round(conf, 3),
+            "sources": [{"url": u} for u in urls_with_attr] or ([{"url": "gemini"}] if came_from_gemini else []),
+        })
+
     return {
         "query": f"{brand} {product}",
         "sources": [{"title": _host(u), "url": u} for u in rec.sources],
         "specs": rec.specs,
         "features": simple_feats,
         "features_detailed": detailed_feats,
-        "specs_detailed": [
-            {"key": k, "value": v, "sources": [{"url": u} for u in rec.sources]}
-            for k, v in rec.specs.items()
-        ],
+        "specs_detailed": specs_detailed,
         "disclaimers": [],
         "visual_hints": [],
         "warnings": [] if rec.confidence >= 0.75 else ["Low-confidence extraction"],
