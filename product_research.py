@@ -1,27 +1,24 @@
-# product_research.py — v5.0  (2025-09-01)
+# product_research.py — v5.1  (2025-09-01)
 """
 Open-web product-info engine (no paid APIs).
 
-Workflow
-┌ search_serp      – Google HTML / DuckDuckGo fallback
-├ fetch_html       – Playwright→requests
-├ extract_structured_product
-├ regex heuristics – fills gaps
-└ merge            – SpecRecord with confidence score
-
-Public helpers
-• get_product_record(brand, model)
-• research_product(...)  # legacy wrapper used by app.py
+Adds FEATURE extraction:
+• Looks for <ul>/<li> blocks under divs whose class/id hints "feature", "spec",
+  "description", etc.
+• Deduplicates & normalises bullets
+• research_product(...) now returns:
+      "features"            → List[str]    (short bullets, merged)
+      "features_detailed"   → List[{"feature": str, "sources": [...] }]
 """
+
 from __future__ import annotations
-import re, logging, os
+import re, logging
 from dataclasses import dataclass, field
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Dict, List, Any, Tuple
 
 from rapidfuzz import fuzz
 from pint import UnitRegistry
-ureg = UnitRegistry(auto_reduce_dimensions=True)
 
 from fetcher import (
     search_serp,
@@ -30,6 +27,7 @@ from fetcher import (
     download_pdf,
 )
 
+ureg = UnitRegistry(auto_reduce_dimensions=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -46,13 +44,15 @@ DENY_HINTS = [
 ]
 
 SPEC_RE: List[Tuple[str, re.Pattern]] = [
-    ("battery_life_h", re.compile(r"battery\\s*(life|playtime|runtime)[^\\d]{0,15}(\\d+(?:\\.\\d+)?)\\s*(hours?|hrs?|h)", re.I)),
-    ("capacity_mah",  re.compile(r"(\\d+(?:\\.\\d+)?)\\s*mah", re.I)),
-    ("weight_g",      re.compile(r"weight[^\\d]{0,10}(\\d+(?:\\.\\d+)?)\\s*(g|grams?)", re.I)),
-    ("weight_lb",     re.compile(r"weight[^\\d]{0,10}(\\d+(?:\\.\\d+)?)\\s*(lb|pounds?)", re.I)),
-    ("bluetooth_version", re.compile(r"bluetooth\\s*(\\d(?:\\.\\d)?)", re.I)),
-    ("ip_rating",     re.compile(r"ip\\s*([0-9]{2})", re.I)),
+    ("battery_life_h", re.compile(r"battery\s*(life|playtime|runtime)[^\d]{0,15}(\d+(?:\.\d+)?)\s*(hours?|hrs?|h)", re.I)),
+    ("capacity_mah",  re.compile(r"(\d+(?:\.\d+)?)\s*mah", re.I)),
+    ("weight_g",      re.compile(r"weight[^\d]{0,10}(\d+(?:\.\d+)?)\s*(g|grams?)", re.I)),
+    ("weight_lb",     re.compile(r"weight[^\d]{0,10}(\d+(?:\.\d+)?)\s*(lb|pounds?)", re.I)),
+    ("bluetooth_version", re.compile(r"bluetooth\s*(\d(?:\.\d)?)", re.I)),
+    ("ip_rating",     re.compile(r"ip\s*([0-9]{2})", re.I)),
 ]
+
+FEATURE_H1NTS = ("feature", "key", "highlight", "benefit", "overview", "description")
 
 # ────────────────── helpers ──────────────────
 def _unit(qty):
@@ -84,21 +84,26 @@ def _url_ok(u: str) -> bool:
         return False
     return True
 
-# ────────────────── core dataclass ──────────────────
+# ────────────────── core dataclasses ──────────────────
 @dataclass
 class SpecRecord:
     brand: str
     model: str
     specs: Dict[str, str] = field(default_factory=dict)
-    sources: Dict[str, Dict[str, str]] = field(default_factory=dict)  # url → attrs
+    features: Dict[str, set] = field(default_factory=lambda: defaultdict(set))  # feat → set(urls)
+    sources: Dict[str, Dict[str, str]] = field(default_factory=dict)           # url → attrs
     confidence: float = 0.0
 
-    def merge(self, attrs: Dict[str, str], url: str):
+    def merge_specs(self, attrs: Dict[str, str], url: str):
         self.sources[url] = attrs
         for k, v in attrs.items():
             nk = k.lower()
             if nk not in self.specs:
                 self.specs[nk] = _norm_val(nk, v)
+
+    def merge_features(self, feats: List[str], url: str):
+        for f in feats:
+            self.features[f].add(url)
 
     def finalise(self):
         votes = Counter()
@@ -109,7 +114,38 @@ class SpecRecord:
         self.confidence = min(1.0, (len(votes) / 7.0) * (1 + 0.1 * max(diversity - 1, 0)))
 
 # ────────────────── extraction helpers ──────────────────
-def _extract_from_html(html: str, url: str) -> Dict[str, str]:
+def _extract_features_from_html(html: str) -> List[str]:
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    bullets: List[str] = []
+
+    # 1) <li> inside obvious feature blocks
+    for tag in soup.find_all(["ul", "ol"]):
+        wrapper = tag
+        for _ in range(3):                       # climb up a bit to inspect parents
+            if any(h in (wrapper.get("class") or []) for h in FEATURE_H1NTS):
+                bullets.extend(li.get_text(" ", strip=True) for li in tag.find_all("li"))
+                break
+            wrapper = wrapper.parent or wrapper
+
+    # 2) fallback: any <li> near the top that looks short & punchy
+    if len(bullets) < 4:
+        for li in soup.find_all("li")[:30]:
+            txt = li.get_text(" ", strip=True)
+            if 20 < len(txt) < 120:
+                bullets.append(txt)
+
+    # dedupe with fuzzy
+    out: List[str] = []
+    for b in bullets:
+        if not any(fuzz.token_set_ratio(b, o) > 90 for o in out):
+            out.append(b)
+    return out[:12]   # cap
+
+def _extract_from_html(html: str, url: str) -> Tuple[Dict[str, str], List[str]]:
     attrs = dict(extract_structured_product(html, url).get("attributes", {}))
     plain = re.sub(r"<[^>]+>", " ", html)
     for k, pat in SPEC_RE:
@@ -121,13 +157,14 @@ def _extract_from_html(html: str, url: str) -> Dict[str, str]:
                 attrs[k] = f"{m.group(1)} {m.group(2)}"
             else:
                 attrs[k] = m.group(1)
-    return attrs
+    features = _extract_features_from_html(html)
+    return attrs, features
 
 def _extract_from_pdf(data: bytes) -> Dict[str, str]:
     try:
         import pdfplumber, io
         with pdfplumber.open(io.BytesIO(data)) as pdf:
-            txt = "\\n".join(page.extract_text() or "" for page in pdf.pages)
+            txt = "\n".join(page.extract_text() or "" for page in pdf.pages)
     except Exception:
         return {}
     attrs = {}
@@ -151,24 +188,26 @@ def get_product_record(brand: str, model: str, *, max_urls: int = 12) -> SpecRec
             continue
         h = _host(url)
         if not any(w in h for w in WHITELIST_HINTS + REVIEW_SITES) and not PDF_RE.search(url):
-            continue  # unknown site → skip
+            continue
         try:
             if PDF_RE.search(url):
                 pdf = download_pdf(url)
                 attrs = _extract_from_pdf(pdf) if pdf else {}
+                feats: List[str] = []
             else:
                 html = fetch_html(url, timeout=12)
-                attrs = _extract_from_html(html, url) if html else {}
+                attrs, feats = _extract_from_html(html, url) if html else ({}, [])
         except Exception:
-            attrs = {}
+            attrs, feats = {}, []
         if attrs:
-            rec.merge(attrs, url)
-        if rec.confidence > 0.8:
-            break  # early exit
+            rec.merge_specs(attrs, url)
+        if feats:
+            rec.merge_features(feats, url)
+        if rec.confidence > 0.8 and len(rec.features) >= 4:
+            break
     rec.finalise()
     return rec
 
-# ────────── legacy wrapper (app.py still calls this) ──────────
 def research_product(
     brand: str,
     product: str,
@@ -178,12 +217,20 @@ def research_product(
     max_results: int = 12,
 ) -> Dict[str, Any]:
     rec = get_product_record(brand, product, max_urls=max_results)
+
+    # Flatten features → lists
+    simple_feats = list(rec.features.keys())
+    detailed_feats = [
+        {"feature": f, "sources": [{"url": u} for u in urls]}
+        for f, urls in rec.features.items()
+    ]
+
     return {
         "query": f"{brand} {product}",
         "sources": [{"title": _host(u), "url": u} for u in rec.sources],
         "specs": rec.specs,
-        "features": [],
-        "features_detailed": [],
+        "features": simple_feats,
+        "features_detailed": detailed_feats,
         "specs_detailed": [
             {"key": k, "value": v, "sources": [{"url": u} for u in rec.sources]}
             for k, v in rec.specs.items()
