@@ -11,3 +11,10 @@ beautifulsoup4
 openai>=1.40
 duckduckgo-search>=6.2.10
 pint>=0.24
+# ───────── new deps for open-web pipeline ─────────
+requests-html
+extruct
+w3lib
+rapidfuzz
+pdfplumber
+typing_extensions     # for ParamSpec
