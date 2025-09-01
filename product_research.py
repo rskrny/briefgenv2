@@ -1,10 +1,10 @@
-# product_research.py — 2025-09-01
+# product_research.py — 2025-09-01  (fix: accept vision_category_tags kwarg)
 """
 Product-info engine for briefgenv2.
 
-• First tries open-web scraping (Google SERP + HTML/PDF parsing).
+• Tries open-web scraping first.
 • If nothing verified, falls back to Gemini-Pro via gemini_fetcher.py.
-• Returns dict that app.py already expects.
+• Signature now accepts vision_category_tags (ignored) so app.py runs without edits.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Dict, List, Any, Tuple
 from rapidfuzz import fuzz
 from pint import UnitRegistry
 
-# ── local deps ──
+# local helpers
 from fetcher import (
     search_serp,
     fetch_html,
@@ -166,7 +166,7 @@ def _extract_from_pdf(data: bytes) -> Dict[str, str]:
                 attrs[k] = m.group(1)
     return attrs
 
-# ────────────────── main function ──────────────────
+# ────────────────── scraper first ──────────────────
 def get_product_record(brand: str, model: str, *, max_urls: int = 12) -> SpecRecord:
     rec = SpecRecord(brand, model)
     query = f"{brand} {model} specifications"
@@ -201,30 +201,30 @@ def research_product(
     product: str,
     *,
     product_url_override: str = "",
+    vision_category_tags: List[str] | None = None,   # ← now accepted / ignored
     max_results: int = 12,
 ) -> Dict[str, Any]:
-    # 1) Try scraper first
+    # 1) scraper
     rec = get_product_record(brand, product, max_urls=max_results)
 
-    # 2) Fallback to Gemini if nothing verified and no manual URL
+    # 2) Gemini fallback
     if not rec.specs and not rec.features and not product_url_override:
         from gemini_fetcher import gemini_product_info
         data = gemini_product_info(brand, product)
         if data.get("status") == "OK":
             for k, v in data.get("specs", {}).items():
                 rec.specs[k] = v
-            for idx, feat in enumerate(data.get("features", [])):
+            for feat in data.get("features", []):
                 rec.features.setdefault(feat, set()).add("gemini")
             for cit in data.get("citations", []):
-                attr = cit.get("attr")
-                url  = cit.get("url")
+                attr = cit.get("attr"); url = cit.get("url")
                 if attr and url:
                     rec.sources.setdefault(url, {})
                     if attr in rec.specs:
                         rec.sources[url][attr] = rec.specs[attr]
-            rec.confidence = 0.9  # Gemini self-validated
+            rec.confidence = 0.9
 
-    # 3) Flatten return format
+    # 3) flatten
     simple_feats = list(rec.features.keys())
     detailed_feats = [
         {"feature": f, "sources": [{"url": u} for u in urls]}
