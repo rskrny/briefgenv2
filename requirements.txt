@@ -10,6 +10,7 @@ requests
 beautifulsoup4
 openai>=1.40
 duckduckgo-search>=6.2.10
+ddgs
 pint>=0.24
 # ───────── new deps for open-web pipeline ─────────
 requests-html
