@@ -1,15 +1,15 @@
-# gemini_fetcher.py — 2025-09-01 (uses google_search_retrieval tool)
+# gemini_fetcher.py — 2025-09-01 (fix: use model_name=; google_search_retrieval tool)
 """
 Fetch product specs/features via Gemini with Google Search Retrieval.
 
 Prereqs:
-- env var GOOGLE_API_KEY is set (Streamlit secrets covers this).
+- GOOGLE_API_KEY set (Streamlit secrets covers this).
 - google-generativeai >= 0.7.0
 
 Behavior:
-- Tries gemini-1.5-pro; if unavailable, falls back to gemini-1.5-flash.
+- Attempts gemini-1.5-pro; falls back to gemini-1.5-flash.
 - Enables the Google Search Retrieval tool so Gemini can look up pages.
-- Returns a strict JSON dict or {"status": "ERROR", "error": "..."} on failure.
+- Returns strict JSON or {"status": "ERROR", "error": "..."} on failure.
 """
 
 from __future__ import annotations
@@ -54,13 +54,14 @@ Return ONLY JSON.
 CANDIDATE_MODELS = ["gemini-1.5-pro", "gemini-1.5-flash"]
 
 
-def _make_model(name: str):
+def _make_model(model_name: str):
     """
     Construct a GenerativeModel with Google Search Retrieval enabled.
+    NOTE: older SDKs use model_name= (not name=).
     """
     return genai.GenerativeModel(
-        name=name,
-        tools=[{"google_search_retrieval": {}}],  # <-- correct tool name
+        model_name=model_name,
+        tools=[{"google_search_retrieval": {}}],
         generation_config={"temperature": 0.2, "max_output_tokens": 1200},
         safety_settings={"HARASSMENT": "block_none"},
     )
@@ -68,10 +69,9 @@ def _make_model(name: str):
 
 def _strip_code_fence(text: str) -> str:
     if not text:
-        return text
+        return ""
     t = text.strip()
     if t.startswith("```"):
-        # remove surrounding fences; also drop a leading 'json' tag if present
         t = t.strip("` \n")
         if t.lower().startswith("json"):
             t = t[4:].lstrip()
