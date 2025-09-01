@@ -1,12 +1,12 @@
-# product_research.py — 2025-09-01  (align specs_detailed schema w/ app.py)
+# product_research.py — 2025-09-01 (better PDP parsing + junk filters)
 """
 Product-info engine for briefgenv2.
 
-• Tries open-web scraping first (SERP → HTML/PDF parse).
-• If nothing verified, falls back to Gemini via gemini_fetcher.py.
-• Returns object expected by app.py, including:
-    - features_detailed: [{"text": str, "confidence": float, "sources":[{"url":str},...]}]
-    - specs_detailed:    [{"key":  str, "value": str, "confidence": float, "sources":[{"url":str},...]}]
+Improvements:
+- Amazon PDP parser (tech-spec table + detail bullets)
+- Filters out UI/shortcut/breadcrumb/category bullets
+- Adds more spec patterns (dimensions, weight capacity, materials)
+- Aligns schemas expected by app.py
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ from typing import Dict, List, Any, Tuple, Set
 
 from rapidfuzz import fuzz
 from pint import UnitRegistry
+from bs4 import BeautifulSoup  # ensure installed
 
-# local helpers
 from fetcher import (
     search_serp,
     fetch_html,
@@ -30,28 +30,35 @@ ureg = UnitRegistry(auto_reduce_dimensions=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ────────────────── static config ──────────────────
+# ────────────────── site/domain rules ──────────────────
 WHITELIST_HINTS = [
     "amazon.", "bestbuy.", "walmart.", "target.", "homedepot.", "newegg.",
-    "bhphotovideo.", "lenovo.", "dell.", "asus.", "acer.", "apple.",
+    "bhphotovideo.", "lenovo.", "dell.", "asus.", "acer.", "apple.", "rei.", "backcountry."
 ]
-REVIEW_SITES = ["rtings.com", "notebookcheck.net", "gsmarena.com", "techradar."]
+REVIEW_SITES = ["rtings.com", "notebookcheck.net", "gsmarena.com", "techradar.", "wired.", "cnet."]
 PDF_RE = re.compile(r"\.pdf($|[?#])", re.I)
 DENY_HINTS = [
     "support.", "help.", "community.", "forum.", "youtube.", "facebook.",
     "reddit.", "pinterest.", "twitter.", "instagram.", "linkedin.",
 ]
 
+# ────────────────── spec regexes ──────────────────
 SPEC_RE: List[Tuple[str, re.Pattern]] = [
-    ("battery_life_h", re.compile(r"battery\s*(life|playtime|runtime)[^\d]{0,15}(\d+(?:\.\d+)?)\s*(hours?|hrs?|h)", re.I)),
+    ("battery_life_h", re.compile(r"battery\s*(life|playtime|runtime)[^\d]{0,15}(\d+(?:\.\d+)?)\s*(h|hr|hrs|hours?)", re.I)),
     ("capacity_mah",  re.compile(r"(\d+(?:\.\d+)?)\s*mah", re.I)),
-    ("weight_g",      re.compile(r"weight[^\d]{0,10}(\d+(?:\.\d+)?)\s*(g|grams?)", re.I)),
-    ("weight_lb",     re.compile(r"weight[^\d]{0,10}(\d+(?:\.\d+)?)\s*(lb|pounds?)", re.I)),
     ("bluetooth_version", re.compile(r"bluetooth\s*(\d(?:\.\d)?)", re.I)),
-    ("ip_rating",     re.compile(r"ip\s*([0-9]{2})", re.I)),
+    ("ip_rating",     re.compile(r"\bip\s*([0-9]{2})\b", re.I)),
+    # physicals
+    ("weight_g",      re.compile(r"\bweight[^\d]{0,12}(\d+(?:\.\d+)?)\s*(g|grams?)\b", re.I)),
+    ("weight_lb",     re.compile(r"\bweight[^\d]{0,12}(\d+(?:\.\d+)?)\s*(lb|lbs|pounds?)\b", re.I)),
+    ("weight_capacity_lb", re.compile(r"(weight\s*capacity|max\s*load|supports\s*up\s*to)[^\d]{0,12}(\d+(?:\.\d+)?)\s*(lb|lbs|pounds?)", re.I)),
+    ("dimensions_in", re.compile(r"(\d+(?:\.\d+)?)\s*(?:x|×)\s*(\d+(?:\.\d+)?)\s*(?:x|×)\s*(\d+(?:\.\d+)?)(?:\s*(in|inch|inches))", re.I)),
+    ("dimensions_cm", re.compile(r"(\d+(?:\.\d+)?)\s*(?:x|×)\s*(\d+(?:\.\d+)?)\s*(?:x|×)\s*(\d+(?:\.\d+)?)(?:\s*(cm|centimeters?))", re.I)),
+    ("material",      re.compile(r"\b(material|fabric)\b[^\n:]{0,15}:\s*([A-Za-z0-9 \-\/]+)", re.I)),
 ]
 
-FEATURE_HINTS = ("feature", "key", "highlight", "benefit", "overview", "description")
+FEATURE_HINTS = ("feature", "key", "highlight", "benefit", "overview", "description", "feature-bullets", "detail-bullets")
+JUNK_HINTS = ("breadcrumb", "menu", "nav", "navbar", "toolbar", "shortcut", "hotkey", "category", "department")
 
 # ────────────────── helpers ──────────────────
 def _unit(qty):
@@ -62,9 +69,14 @@ def _unit(qty):
 
 def _norm_val(k: str, v: str) -> str:
     try:
-        if k.startswith("weight"):
-            return f"{_unit(ureg(v.strip())):.2f} g"
-        if k.startswith("capacity"):
+        if k.startswith("weight_") and v:
+            # auto-convert to grams where possible
+            if k.endswith("_lb"):
+                g = _unit(ureg(f"{v.split()[0]} lb")) * 1000 / ureg.kg  # to grams
+                return f"{g:.2f} g"
+            if k.endswith("_g"):
+                return f"{float(v.split()[0]):.2f} g"
+        if k.startswith("capacity_mah"):
             return f"{float(v):g} mAh"
     except Exception:
         pass
@@ -88,7 +100,7 @@ class SpecRecord:
     features: Dict[str, set] = field(default_factory=lambda: defaultdict(set))
     # url → attrs extracted from that url
     sources: Dict[str, Dict[str, str]] = field(default_factory=dict)
-    # which spec keys were introduced by Gemini (no direct URL) — used for confidence/sources
+    # specs introduced by Gemini (no direct URL)
     specs_from_gemini: Set[str] = field(default_factory=set)
     confidence: float = 0.0
 
@@ -115,29 +127,49 @@ class SpecRecord:
         diversity = len({_host(u) for u in self.sources})
         self.confidence = min(1.0, (len(votes) / 7.0) * (1 + 0.1 * max(diversity - 1, 0)))
 
-# ────────────────── HTML/PDF extraction ──────────────────
+# ────────────────── extraction helpers ──────────────────
+_SHORTCUT_RE = re.compile(r"\b(shift|ctrl|control|alt|cmd|command|option)\b\s*(\+|plus)", re.I)
+_BREADCRUMB_RE = re.compile(r"^\s*(home|orders|cart|search|account|sign in|sign out)\b", re.I)
+_CATEGORY_SINGLETON_RE = re.compile(r"^\s*(chairs|camping|camping & hiking|outdoor recreation)\s*$", re.I)
+
+def _is_junk_bullet(li: Any) -> bool:
+    txt = li.get_text(" ", strip=True)
+    if _SHORTCUT_RE.search(txt):
+        return True
+    if _BREADCRUMB_RE.search(txt):
+        return True
+    if _CATEGORY_SINGLETON_RE.match(txt):
+        return True
+    # parent classes/ids suggest navigation/menus
+    ptr = li
+    for _ in range(4):
+        ptr = ptr.parent or ptr
+        classes = " ".join(ptr.get("class") or [])
+        id_ = ptr.get("id") or ""
+        if any(h in (classes + " " + id_).lower() for h in JUNK_HINTS):
+            return True
+    return False
+
 def _extract_features_from_html(html: str) -> List[str]:
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        return []
     soup = BeautifulSoup(html, "html.parser")
     bullets: List[str] = []
-    # Feature-like blocks
-    for tag in soup.find_all(["ul", "ol"]):
-        wrapper = tag
-        for _ in range(3):
-            cls = " ".join(wrapper.get("class") or []) + " " + (wrapper.get("id") or "")
-            if any(hint in cls.lower() for hint in FEATURE_HINTS):
-                bullets.extend(li.get_text(" ", strip=True) for li in tag.find_all("li"))
-                break
-            wrapper = wrapper.parent or wrapper
-    # Fallback: first 30 list items that look like bullets
+    # Amazon & general: feature/detail bullets
+    for ul in soup.find_all(["ul", "ol"]):
+        cls = " ".join(ul.get("class") or []) + " " + (ul.get("id") or "")
+        if any(hint in cls.lower() for hint in FEATURE_HINTS):
+            for li in ul.find_all("li"):
+                if not _is_junk_bullet(li):
+                    t = li.get_text(" ", strip=True)
+                    if 20 <= len(t) <= 160:
+                        bullets.append(t)
+    # Fallback: consider first 40 list items, but filter junk
     if len(bullets) < 4:
-        for li in soup.find_all("li")[:30]:
-            txt = li.get_text(" ", strip=True)
-            if 20 < len(txt) < 120:
-                bullets.append(txt)
+        for li in soup.find_all("li")[:40]:
+            if not _is_junk_bullet(li):
+                t = li.get_text(" ", strip=True)
+                if 20 <= len(t) <= 160:
+                    bullets.append(t)
+
     # Fuzzy dedupe
     out: List[str] = []
     for b in bullets:
@@ -145,18 +177,81 @@ def _extract_features_from_html(html: str) -> List[str]:
             out.append(b)
     return out[:12]
 
-def _extract_from_html(html: str, url: str) -> Tuple[Dict[str, str], List[str]]:
-    attrs = dict(extract_structured_product(html, url).get("attributes", {}))
-    plain = re.sub(r"<[^>]+>", " ", html)
+def _extract_from_amazon(html: str) -> Dict[str, str]:
+    """
+    Parse Amazon PDP tech-specs + detail bullets table sections.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    attrs: Dict[str, str] = {}
+
+    # 1) Technical Details table(s)
+    for table_id in ["productDetails_techSpec_section_1", "productDetails_techSpec_section_2"]:
+        table = soup.find("table", id=table_id)
+        if not table:
+            continue
+        for row in table.find_all("tr"):
+            th = row.find("th")
+            td = row.find("td")
+            if not th or not td:
+                continue
+            key = th.get_text(" ", strip=True).lower()
+            val = td.get_text(" ", strip=True)
+            if "item weight" in key and val:
+                attrs["weight_lb"] = re.sub(r"[^\d.]", " ", val).strip().split()[0] + " lb"
+            if ("maximum weight" in key or "weight limit" in key) and val:
+                attrs["weight_capacity_lb"] = re.sub(r"[^\d.]", " ", val).strip().split()[0] + " lb"
+            if "product dimensions" in key and val:
+                dims = val.lower()
+                if "cm" in dims:
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)", dims)
+                    if m: attrs["dimensions_cm"] = f"{m.group(1)} x {m.group(2)} x {m.group(3)}"
+                else:
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)", dims)
+                    if m: attrs["dimensions_in"] = f"{m.group(1)} x {m.group(2)} x {m.group(3)} in"
+            if "material" in key and val:
+                attrs["material"] = val
+
+    # 2) Generic regex pass over page text
+    plain = soup.get_text(" ", strip=True)
     for k, pat in SPEC_RE:
+        if k in attrs:
+            continue
         m = pat.search(plain)
         if m:
-            if "mah" in k:
-                attrs[k] = m.group(1)
-            elif k in ("weight_lb", "weight_g"):
-                attrs[k] = f"{m.group(1)} {m.group(2)}"
+            if k in ("weight_lb", "weight_g"):
+                num = m.group(1); unit = m.group(2)
+                attrs[k] = f"{num} {unit}"
+            elif k in ("dimensions_in", "dimensions_cm"):
+                attrs[k] = f"{m.group(1)} x {m.group(2)} x {m.group(3)}"
             else:
                 attrs[k] = m.group(1)
+    return attrs
+
+def _extract_from_html(html: str, url: str) -> Tuple[Dict[str, str], List[str]]:
+    attrs = dict(extract_structured_product(html, url).get("attributes", {}))
+    host = _host(url)
+    if "amazon." in host:
+        # enrich with Amazon-specific parsing
+        try:
+            a = _extract_from_amazon(html)
+            attrs.update(a)
+        except Exception:
+            pass
+
+    # Generic regex sweep for additional specs
+    plain = re.sub(r"<[^>]+>", " ", html)
+    for k, pat in SPEC_RE:
+        if k in attrs:
+            continue
+        m = pat.search(plain)
+        if m:
+            if k in ("weight_lb", "weight_g"):
+                attrs[k] = f"{m.group(1)} {m.group(2)}"
+            elif k in ("dimensions_in", "dimensions_cm"):
+                attrs[k] = f"{m.group(1)} x {m.group(2)} x {m.group(3)}"
+            else:
+                attrs[k] = m.group(1)
+
     feats = _extract_features_from_html(html)
     return attrs, feats
 
@@ -171,16 +266,16 @@ def _extract_from_pdf(data: bytes) -> Dict[str, str]:
     for k, pat in SPEC_RE:
         m = pat.search(txt)
         if m:
-            if "mah" in k:
-                attrs[k] = m.group(1)
-            elif k in ("weight_lb", "weight_g"):
+            if k in ("weight_lb", "weight_g"):
                 attrs[k] = f"{m.group(1)} {m.group(2)}"
+            elif k in ("dimensions_in", "dimensions_cm"):
+                attrs[k] = f"{m.group(1)} x {m.group(2)} x {m.group(3)}"
             else:
                 attrs[k] = m.group(1)
     return attrs
 
 # ────────────────── scraper first ──────────────────
-def get_product_record(brand: str, model: str, *, max_urls: int = 12) -> SpecRecord:
+def get_product_record(brand: str, model: str, *, max_urls: int = 12) -> 'SpecRecord':
     rec = SpecRecord(brand, model)
     query = f"{brand} {model} specifications"
     for url in search_serp(query, max_results=max_urls):
@@ -225,29 +320,26 @@ def research_product(
         from gemini_fetcher import gemini_product_info
         data = gemini_product_info(brand, product)
         if data.get("status") == "OK":
-            # record specs and mark they came from Gemini (in case no URL citations)
             for k, v in data.get("specs", {}).items():
                 nk = k.lower()
                 rec.specs[nk] = _norm_val(nk, v)
                 rec.specs_from_gemini.add(nk)
-            # features
             for feat in data.get("features", []):
-                rec.features.setdefault(feat, set()).add("gemini")
-            # map citations to sources for specs if provided
+                # filter out junk again defensively
+                if not _SHORTCUT_RE.search(feat) and not _BREADCRUMB_RE.search(feat) and not _CATEGORY_SINGLETON_RE.match(feat):
+                    rec.features.setdefault(feat, set()).add("gemini")
             for cit in data.get("citations", []):
-                attr = (cit.get("attr") or "").lower()
-                url  = cit.get("url")
+                attr = (cit.get("attr") or "").lower(); url = cit.get("url")
                 if attr and url:
                     rec.sources.setdefault(url, {})
                     if attr in rec.specs:
                         rec.sources[url][attr] = rec.specs[attr]
-            rec.confidence = 0.9  # high-level product record confidence
+            rec.confidence = 0.9
 
     # 3) Flatten for app.py
-    # Features (simple list)
     simple_feats = list(rec.features.keys())
 
-    # Features (detailed)
+    # Features detailed
     detailed_feats: List[Dict[str, Any]] = []
     for ftxt, urls in rec.features.items():
         n = len([u for u in urls if u != "gemini"])
@@ -260,14 +352,20 @@ def research_product(
             "sources": [{"url": u} for u in urls if u != "gemini"] or [{"url": "gemini"}],
         })
 
-    # Specs (detailed: now with confidence + sources)
+    # Specs detailed
     specs_detailed: List[Dict[str, Any]] = []
     for k, v in rec.specs.items():
         urls_with_attr = [u for u, attrs in rec.sources.items() if k in attrs]
         n = len(urls_with_attr)
         came_from_gemini = (k in rec.specs_from_gemini)
-        conf = 0.55 + 0.15 * min(n, 3) + (0.1 if came_from_gemini else 0.0)
-        conf = max(0.5, min(0.95, conf))
+        # small bonus if one of the sources is Amazon or brand domain
+        bonus = 0.0
+        for u in urls_with_attr:
+            h = _host(u)
+            if "amazon." in h or any(h.endswith(d.strip(".")) for d in ["apple.", "dell.", "lenovo.", "rei.", "backcountry."]):
+                bonus = max(bonus, 0.1)
+        conf = 0.55 + 0.15 * min(n, 3) + bonus + (0.05 if came_from_gemini else 0.0)
+        conf = max(0.5, min(0.98, conf))
         specs_detailed.append({
             "key": k,
             "value": v,
