@@ -1,23 +1,8 @@
-# fetcher.py — v5.0  (2025-09-01)
-"""
-Open-web fetching utilities for briefgenv2.
-
-• No paid API keys required.  
-• If Playwright is present we use it for JS-heavy pages, otherwise fall back to
-  plain `requests`.  
-• Exposes:
-    ─ fetch_html(url)
-    ─ search_serp(query, max_results)
-    ─ extract_structured_product(html, url)
-    ─ download_pdf(url)
-"""
-
+# fetcher.py — 2025-09-01 (ddgs rename handled, minor polish)
 from __future__ import annotations
-import asyncio, contextlib, json, re, os, time, logging
+import asyncio, json, re, os, logging
 from typing import List, Dict, Optional, Any
-from urllib.parse import quote_plus, urlparse
 
-# ─────────────────────────── config ───────────────────────────
 UA = os.getenv(
     "BRIEFGEN_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -29,7 +14,7 @@ PLAYWRIGHT_ENABLED = os.getenv("PY_DISABLE_PLAYWRIGHT", "0") != "1"
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ───────────────────── HTML FETCHING ────────────────────────
+# ---------------- HTML fetching ----------------
 def _sync_requests_html(url: str, timeout: int = 15) -> Optional[str]:
     try:
         import requests
@@ -39,7 +24,6 @@ def _sync_requests_html(url: str, timeout: int = 15) -> Optional[str]:
     except Exception as exc:
         logger.debug("requests fetch failed: %s", exc, exc_info=False)
     return None
-
 
 async def _playwright_html(url: str, timeout: int = 15) -> Optional[str]:
     try:
@@ -59,9 +43,7 @@ async def _playwright_html(url: str, timeout: int = 15) -> Optional[str]:
         logger.debug("playwright fetch failed: %s", exc, exc_info=False)
         return None
 
-
 def fetch_html(url: str, timeout: int = 15) -> Optional[str]:
-    """Main entry – Playwright first, requests fallback."""
     html: Optional[str] = None
     if PLAYWRIGHT_ENABLED:
         try:
@@ -72,8 +54,10 @@ def fetch_html(url: str, timeout: int = 15) -> Optional[str]:
             loop.close()
     return html or _sync_requests_html(url, timeout)
 
-# ───────────────────── SERP SCRAPER (Google HTML) ─────────────────────
+# ---------------- SERP scraper ----------------
 def search_serp(query: str, max_results: int = 15) -> List[str]:
+    # Google HTML parse (best effort)
+    from urllib.parse import quote_plus
     q = quote_plus(query)
     url = f"https://www.google.com/search?q={q}&num={max_results}&hl=en"
     html = _sync_requests_html(url, timeout=10)
@@ -86,19 +70,23 @@ def search_serp(query: str, max_results: int = 15) -> List[str]:
         if urls:
             return urls[:max_results]
 
-    # fallback – DuckDuckGo free library
+    # Fallback to ddgs (new name of duckduckgo_search)
     try:
-        from duckduckgo_search import DDGS
+        try:
+            from ddgs import DDGS  # new package name
+        except Exception:
+            from duckduckgo_search import DDGS  # backward compatibility
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
-                urls.append(r.get("href"))
+                href = r.get("href") or r.get("link") or r.get("url")
+                if href:
+                    urls.append(href)
     except Exception as exc:
-        logger.debug("DuckDuckGo fallback failed: %s", exc, exc_info=False)
+        logger.debug("DDGS fallback failed: %s", exc, exc_info=False)
     return urls[:max_results]
 
-# ───────────────────── structured markup extractor ─────────────────────
+# ---------------- structured extractor ----------------
 def extract_structured_product(html: str, url: str) -> Dict[str, Any]:
-    """Pull Product nodes via extruct; return {'attributes': {}, 'raw': [...]}."""
     try:
         import extruct, w3lib.html
     except ImportError:
@@ -110,7 +98,6 @@ def extract_structured_product(html: str, url: str) -> Dict[str, Any]:
         for node in data.get(syntax, []):
             if isinstance(node, dict) and node.get("@type") in ("Product", ["Product"]):
                 product_nodes.append(node)
-
     attrs: Dict[str, str] = {}
     for node in product_nodes:
         name = node.get("name") or node.get("title")
@@ -126,13 +113,12 @@ def extract_structured_product(html: str, url: str) -> Dict[str, Any]:
                 k = p.get("name") or p.get("propertyID")
                 v = p.get("value") or p.get("valueReference")
                 if k and v:
-                    attrs.setdefault(k.lower(), str(v))
+                    attrs.setdefault((k or "").lower(), str(v))
         for k in ("weight", "gtin13", "gtin14", "gtin", "mpn", "sku"):
             if node.get(k):
                 attrs.setdefault(k, node[k])
     return {"attributes": attrs, "raw": product_nodes}
 
-# ───────────────────── PDF DOWNLOAD ─────────────────────
 def download_pdf(url: str, timeout: int = 20) -> Optional[bytes]:
     try:
         import requests
